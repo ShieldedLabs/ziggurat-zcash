@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use ziggurat_core_crawler::connection::KnownConnection;
 use ziggurat_zcash::protocol::payload::{ProtocolVersion, VarStr};
@@ -36,6 +37,12 @@ pub struct KnownNode {
     pub start_height: Option<i32>,
     /// The number of services supported by the node.
     pub services: Option<u64>,
+    /// The node's transaction relay flag.
+    pub relay: Option<bool>,
+    /// The first time the node's Version message arrived.
+    pub first_seen: Option<DateTime<Utc>>,
+    /// The latest time the node's Version message arrived.
+    pub last_seen: Option<DateTime<Utc>>,
     /// The number of subsequent connection errors.
     pub connection_failures: u8,
     /// The node's state.

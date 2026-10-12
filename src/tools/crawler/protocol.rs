@@ -1,5 +1,6 @@
 use std::{io, net::SocketAddr, sync::Arc, time::Instant};
 
+use chrono::Utc;
 use futures_util::SinkExt;
 use pea2pea::{
     protocols::{Handshake, Reading, Writing},
@@ -10,7 +11,7 @@ use tracing::*;
 use ziggurat_zcash::{
     protocol::{
         message::Message,
-        payload::{block::Headers, Addr, Version},
+        payload::{block::Headers, Addr, VarStr, Version},
     },
     tools::synthetic_node::MessageCodec,
 };
@@ -23,6 +24,9 @@ pub const MAX_CONCURRENT_CONNECTIONS: u16 = 1200;
 pub const MAIN_LOOP_INTERVAL_SECS: u64 = 20;
 pub const RECONNECT_INTERVAL_SECS: u64 = 60;
 pub const MAX_WAIT_FOR_ADDR_SECS: u64 = 3 * 60;
+/// The NU7 mainnet protocol version. The crawler advertises it, so NU7 nodes keep
+/// accepting the crawler after activation (2026-11-05).
+pub const NU7_PROTOCOL_VERSION: u32 = 170_190;
 
 /// Represents the crawler together with network metrics it has collected.
 #[derive(Clone)]
@@ -30,6 +34,8 @@ pub struct Crawler {
     node: Pea2PeaNode,
     pub known_network: Arc<KnownNetwork>,
     pub start_time: Instant,
+    /// The user agent the crawler sends in its Version message.
+    user_agent: String,
 }
 
 impl Pea2Pea for Crawler {
@@ -40,7 +46,7 @@ impl Pea2Pea for Crawler {
 
 impl Crawler {
     /// Creates a new instance of the `Crawler` without starting it.
-    pub async fn new() -> Self {
+    pub async fn new(user_agent: String) -> Self {
         let config = Config {
             name: Some("crawler".into()),
             listener_ip: None,
@@ -52,6 +58,7 @@ impl Crawler {
             node: Pea2PeaNode::new(config),
             known_network: Default::default(),
             start_time: Instant::now(),
+            user_agent,
         }
     }
 
@@ -113,8 +120,10 @@ impl Handshake for Crawler {
         let own_listening_addr: SocketAddr = ([127, 0, 0, 1], 0).into();
         let mut framed_stream = Framed::new(self.borrow_stream(&mut conn), MessageCodec::default());
 
-        let own_version = Message::Version(Version::new(conn_addr, own_listening_addr));
-        framed_stream.send(own_version).await?;
+        let mut own_version =
+            Version::new(conn_addr, own_listening_addr).with_version(NU7_PROTOCOL_VERSION);
+        own_version.user_agent = VarStr(self.user_agent.clone());
+        framed_stream.send(Message::Version(own_version)).await?;
 
         // Here should be waiting for remote version message but as some nodes don't send it
         // quickly enough we will wait for it in the process_message function.
@@ -178,6 +187,10 @@ impl Reading for Crawler {
                     known_node.user_agent = Some(ver.user_agent);
                     known_node.services = Some(ver.services);
                     known_node.start_height = Some(ver.start_height);
+                    known_node.relay = Some(ver.relay);
+                    let now = Utc::now();
+                    known_node.first_seen.get_or_insert(now);
+                    known_node.last_seen = Some(now);
                 }
 
                 let _ = self.unicast(source, Message::Verack)?.await;

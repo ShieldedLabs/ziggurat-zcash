@@ -31,6 +31,16 @@ OPTIONS:
 
 `--seed-addrs` \ `--dns-seed` is the only required argument and needs at least one specified address for it to run.
 
+## Census
+
+The crawler advertises protocol version 170190 (NU7) and the user agent `/zero-census:0.1.0/` (change it with `--user-agent`).
+
+- `--export-dir <dir>` writes `census-<UTC start>.ndjson.gz` after each crawl interval and on exit. Each write replaces the file of the same run. The file has one JSON line per node that sent its Version message: `ip`, `port`, `protocol_version`, `user_agent`, `services`, `start_height`, `relay`, `first_seen`, `last_seen`, `handshake_ms`, `chain`.
+- `chain` is `flux` when the port is 16125, the user agent contains "flux", or `start_height` is more than 100,000 blocks from the Zcash tip. Otherwise it is `zcash`.
+- `--zcash-tip <height>` sets the tip. Without it, the tip is the median start height of Zebra and Zakura peers.
+- `--duration-secs <n>` crawls for n seconds from process start, writes the census, and exits 0.
+- On exit, the crawler prints a census summary without Flux nodes (counts by implementation and version, and the share at protocol 170190 or higher) and appends it to `crawler-log.txt`.
+
 ## Metrics
 
 The crawler collects some data for each node it visits, then aggregates it and compiles related metrics. By default, it will only print and log these on exit (`Ctrl-C`) to a file called `crawler-log.txt`, unless the `--rpc-addr` argument is supplied, in which case these metrics will also be made available to RPC requests.

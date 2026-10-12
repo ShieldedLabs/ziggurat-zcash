@@ -1,10 +1,14 @@
 use std::{
+    fs::OpenOptions,
+    io::Write,
     net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
     sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use dns_lookup::lookup_host;
 use parking_lot::Mutex;
@@ -13,13 +17,17 @@ use pea2pea::{
     Pea2Pea,
 };
 use rand::prelude::IteratorRandom;
-use tokio::{signal, time::sleep};
+use tokio::{
+    signal,
+    time::{sleep, sleep_until},
+};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 use ziggurat_core_crawler::summary::NetworkSummary;
 use ziggurat_zcash::wait_until;
 
 use crate::{
+    census::Census,
     metrics::{NetworkMetrics, ZCASH_P2P_DEFAULT_MAINNET_PORT},
     network::{ConnectionState, KnownNode},
     protocol::{
@@ -29,6 +37,7 @@ use crate::{
     rpc::{initialize_rpc_server, RpcContext},
 };
 
+mod census;
 mod metrics;
 mod network;
 mod protocol;
@@ -57,6 +66,24 @@ struct Args {
     /// Default port used for connecting to the nodes
     #[clap(short, long, value_parser, default_value_t = ZCASH_P2P_DEFAULT_MAINNET_PORT)]
     node_listening_port: u16,
+
+    /// The user agent the crawler sends in its Version message
+    #[clap(long, value_parser, default_value = "/zero-census:0.1.0/")]
+    user_agent: String,
+
+    /// If present, write census-<UTC start>.ndjson.gz (one line per node that sent its
+    /// Version message) to this directory after each crawl interval and on exit
+    #[clap(long, value_parser)]
+    export_dir: Option<PathBuf>,
+
+    /// The Zcash tip height that tells Zcash nodes from Flux nodes
+    /// [default: median start height of Zebra and Zakura peers]
+    #[clap(long, value_parser)]
+    zcash_tip: Option<i32>,
+
+    /// If present, crawl for this many seconds, write the census, and exit
+    #[clap(long, value_parser)]
+    duration_secs: Option<u64>,
     // TODO
     // #[clap(short, long, value_parser, default_value = "testnet")]
     // network: String,
@@ -136,14 +163,28 @@ fn parse_addrs(seed_addrs: Vec<String>, node_listening_port: u16) -> Vec<SocketA
     return parsed_addrs;
 }
 
+/// Writes the census export and logs the outcome.
+fn write_census(census: &Census, dir: &Path, run_start: DateTime<Utc>) {
+    match census.write_ndjson_gz(dir, run_start) {
+        Ok(path) => info!("census written to {}", path.display()),
+        Err(e) => error!("couldn't write census to {}: {}", dir.display(), e),
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    let run_start = Utc::now();
+    let run_start_instant = tokio::time::Instant::now();
     start_logger(LevelFilter::INFO);
     let args = Args::parse();
     let seed_addrs = parse_addrs(args.seed_addrs, args.node_listening_port);
+    let crawl_interval = Duration::from_secs(args.crawl_interval);
+    let export_dir = args.export_dir;
+    let zcash_tip = args.zcash_tip;
+    let duration_secs = args.duration_secs;
 
     // Create the crawler with the given listener address.
-    let crawler = Crawler::new().await;
+    let crawler = Crawler::new(args.user_agent).await;
 
     let mut network_metrics = NetworkMetrics::default();
     let summary_snapshot = Arc::new(Mutex::new(NetworkSummary::default()));
@@ -190,6 +231,7 @@ async fn main() {
     );
 
     let crawler_clone = crawler.clone();
+    let loop_export_dir = export_dir.clone();
     let crawling_loop_task = tokio::spawn(async move {
         let crawler = crawler_clone;
         loop {
@@ -243,7 +285,12 @@ async fn main() {
                 }
             }
 
-            sleep(Duration::from_secs(args.crawl_interval)).await;
+            sleep(crawl_interval).await;
+
+            if let Some(dir) = &loop_export_dir {
+                let nodes = crawler.known_network.nodes();
+                write_census(&Census::new(&nodes, zcash_tip), dir, run_start);
+            }
         }
     });
 
@@ -278,19 +325,50 @@ async fn main() {
         }
     });
 
-    // Wait for Ctrl-c signal, then abort crawling task.
-    let _ = signal::ctrl_c().await;
-    debug!(parent: crawler_clone.node().span(), "interrupt received, exiting process");
+    // A bounded run ends after `duration_secs`, counted from process start.
+    let run_end = async {
+        match duration_secs {
+            Some(secs) => sleep_until(run_start_instant + Duration::from_secs(secs)).await,
+            None => std::future::pending().await,
+        }
+    };
+
+    // Wait for Ctrl-c signal or the end of a bounded run, then abort crawling task.
+    tokio::select! {
+        _ = signal::ctrl_c() => {
+            debug!(parent: crawler_clone.node().span(), "interrupt received, exiting process");
+        }
+        _ = run_end => {
+            info!(parent: crawler_clone.node().span(), "crawl duration reached, exiting process");
+        }
+    }
 
     crawling_loop_task.abort();
     let _ = crawling_loop_task.await;
     crawler_clone.node().shut_down().await;
+
+    let nodes = crawler_clone.known_network.nodes();
+    let census = Census::new(&nodes, zcash_tip);
+    if let Some(dir) = &export_dir {
+        write_census(&census, dir, run_start);
+    }
 
     // Print out summary of network metrics.
     let summary = summary.lock();
     info!(parent: crawler_clone.node().span(), "{}", summary);
     if let Err(e) = summary.log_to_file(LOG_PATH) {
         error!(parent: crawler_clone.node().span(), "couldn't write summary to file: {}", e);
+    }
+
+    // Print out the census summary and append it to the log file.
+    println!("{census}");
+    let appended = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(LOG_PATH)
+        .and_then(|mut file| writeln!(file, "\n{census}"));
+    if let Err(e) = appended {
+        error!(parent: crawler_clone.node().span(), "couldn't write census summary to file: {}", e);
     }
 }
 
@@ -308,7 +386,7 @@ mod tests {
             String::from("127.0.0.1"),
             String::from("192.0.2.235:54321"),
         ];
-        let parsed_addrs = parse_addrs(addrs);
+        let parsed_addrs = parse_addrs(addrs, ZCASH_P2P_DEFAULT_MAINNET_PORT);
 
         let correct_addrs = vec![
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 12345),
