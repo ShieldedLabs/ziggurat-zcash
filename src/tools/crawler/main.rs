@@ -179,12 +179,13 @@ async fn main() {
     }
 
     // Wait for a single successful connection before proceeding.
-    wait_until!(Duration::from_secs(3), crawler.node().num_connected() >= 1);
+    wait_until!(Duration::from_secs(30), crawler.node().num_connected() >= 1);
 
     // Wait for one of the seed nodes to respond with a list of addrs.
+    let initial_node_count = crawler.known_network.num_nodes();
     wait_until!(
         Duration::from_millis(SEED_RESPONSE_TIMEOUT_MS),
-        crawler.known_network.nodes().len() > seed_addrs.len(),
+        crawler.known_network.num_nodes() > initial_node_count,
         Duration::from_millis(SEED_WAIT_LOOP_INTERVAL_MS)
     );
 

@@ -21,7 +21,7 @@ use crate::network::ConnectionState;
 pub const NUM_CONN_ATTEMPTS_PERIODIC: usize = 500;
 pub const MAX_CONCURRENT_CONNECTIONS: u16 = 1200;
 pub const MAIN_LOOP_INTERVAL_SECS: u64 = 20;
-pub const RECONNECT_INTERVAL_SECS: u64 = 5 * 60;
+pub const RECONNECT_INTERVAL_SECS: u64 = 60;
 pub const MAX_WAIT_FOR_ADDR_SECS: u64 = 3 * 60;
 
 /// Represents the crawler together with network metrics it has collected.
@@ -105,8 +105,8 @@ impl Crawler {
 
 #[async_trait::async_trait]
 impl Handshake for Crawler {
-    // Set handshake timeout to 300ms
-    const TIMEOUT_MS: u64 = 300;
+    // Set handshake timeout (must be generous for international nodes and Zebra's delayed Version)
+    const TIMEOUT_MS: u64 = 10_000;
 
     async fn perform_handshake(&self, mut conn: Connection) -> io::Result<Connection> {
         let conn_addr = conn.addr();

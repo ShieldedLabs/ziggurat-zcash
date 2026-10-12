@@ -12,13 +12,13 @@ pub const HEADER_LEN: usize = 24;
 pub const MAX_MESSAGE_LEN: usize = 2 * 1024 * 1024;
 
 /// The current network protocol version number.
-pub const PROTOCOL_VERSION: u32 = 170_120;
+pub const PROTOCOL_VERSION: u32 = 170_140;
 /// The current network version identifier.
 pub const MAGIC_TESTNET: [u8; MAGIC_LEN] = [0xfa, 0x1a, 0xf9, 0xbf];
 pub const MAGIC_MAINNET: [u8; MAGIC_LEN] = [0x24, 0xe9, 0x27, 0x64];
 
 /// Version message user agent
-pub const USER_AGENT: &str = "MagicBean:5.4.2";
+pub const USER_AGENT: &str = "/Zebra:4.1.0/";
 
 #[cfg(test)]
 pub const MAGIC: [u8; MAGIC_LEN] = MAGIC_TESTNET;
