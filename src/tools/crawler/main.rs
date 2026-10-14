@@ -13,10 +13,10 @@ use clap::Parser;
 use dns_lookup::lookup_host;
 use parking_lot::Mutex;
 use pea2pea::{
-    protocols::{Handshake, Reading, Writing},
+    protocols::{Disconnect, Handshake, Reading, Writing},
     Pea2Pea,
 };
-use rand::prelude::IteratorRandom;
+use rand::seq::SliceRandom;
 use tokio::{
     signal,
     time::{sleep, sleep_until},
@@ -32,7 +32,6 @@ use crate::{
     network::{ConnectionState, KnownNode},
     protocol::{
         Crawler, MAIN_LOOP_INTERVAL_SECS, MAX_WAIT_FOR_ADDR_SECS, NUM_CONN_ATTEMPTS_PERIODIC,
-        RECONNECT_INTERVAL_SECS,
     },
     rpc::{initialize_rpc_server, RpcContext},
 };
@@ -201,6 +200,7 @@ async fn main() {
     crawler.enable_handshake().await;
     crawler.enable_reading().await;
     crawler.enable_writing().await;
+    crawler.enable_disconnect().await;
 
     for addr in &seed_addrs {
         let crawler_clone = crawler.clone();
@@ -257,24 +257,26 @@ async fn main() {
             {
                 warn!(parent: crawler.node().span(), "disconnecting from node {} because it didn't send us proper addr message", addr);
                 crawler.node().disconnect(addr).await;
-                crawler
-                    .known_network
-                    .set_node_state(addr, ConnectionState::Disconnected);
+                if let Some(node) = crawler.known_network.nodes.write().get_mut(&addr) {
+                    node.state = ConnectionState::Disconnected;
+                    if node.protocol_version.is_none() {
+                        node.last_failure = Some("no Version within 3 min".into());
+                    }
+                }
             }
 
-            for (addr, _) in crawler
+            // Random order within each retry class, then the most urgent class first.
+            let now = Instant::now();
+            let mut due: Vec<_> = crawler
                 .known_network
                 .nodes()
                 .into_iter()
-                .filter(|(_, node)| {
-                    if let Some(i) = node.last_connected {
-                        i.elapsed().as_secs() >= RECONNECT_INTERVAL_SECS
-                    } else {
-                        true
-                    }
-                })
-                .choose_multiple(&mut rand::thread_rng(), NUM_CONN_ATTEMPTS_PERIODIC)
-            {
+                .filter_map(|(addr, node)| Some((node.retry(now)?, addr)))
+                .collect();
+            due.shuffle(&mut rand::thread_rng());
+            due.sort_by_key(|(retry, _)| *retry);
+
+            for (_, addr) in due.into_iter().take(NUM_CONN_ATTEMPTS_PERIODIC) {
                 if crawler.should_connect(addr) {
                     let crawler_clone = crawler.clone();
                     tokio::spawn(async move {

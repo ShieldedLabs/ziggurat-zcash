@@ -11,6 +11,14 @@ use ziggurat_zcash::protocol::payload::{ProtocolVersion, VarStr};
 
 /// The elapsed time before a connection should be regarded as inactive.
 pub const LAST_SEEN_CUTOFF: u64 = 10 * 60;
+/// The wait before the crawler reconnects to a node that sent its Version.
+/// Zebra and Zakura drop an inbound connection from an IP that connected in the last
+/// 119 seconds (`MIN_PEER_RECONNECTION_DELAY`), so this must be longer.
+pub const RECONNECT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// The first wait before the crawler retries an address that failed at the TCP level.
+/// The wait doubles with each failure, up to 32 minutes.
+const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(60);
+const RETRY_BACKOFF_MAX_DOUBLINGS: u8 = 5;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub enum ConnectionState {
@@ -45,8 +53,51 @@ pub struct KnownNode {
     pub last_seen: Option<DateTime<Utc>>,
     /// The number of subsequent connection errors.
     pub connection_failures: u8,
+    /// The number of connection attempts.
+    pub connection_attempts: u32,
+    /// The time of the latest connection attempt.
+    pub last_attempt: Option<Instant>,
+    /// Why the node sent no Version message on the latest attempt.
+    pub last_failure: Option<String>,
     /// The node's state.
     pub state: ConnectionState,
+}
+
+/// Why a node is due for a connection attempt. The crawler tries the classes in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Retry {
+    /// The node accepted TCP but closed before its Version message, because its inbound
+    /// slots were full. A slot can free up at any time, so the crawler retries on every
+    /// crawl loop. Zebra does not count these rejected attempts against our IP.
+    SlotsFull,
+    /// The crawler never tried the address.
+    New,
+    /// The node sent its Version before, or the address failed at the TCP level.
+    Later,
+}
+
+impl KnownNode {
+    /// Returns why the node is due for a connection attempt at `now`, or `None` if it is not due.
+    pub fn retry(&self, now: Instant) -> Option<Retry> {
+        let since = |time: Option<Instant>| {
+            time.map_or(Duration::MAX, |time| now.saturating_duration_since(time))
+        };
+
+        if self.protocol_version.is_some() {
+            (since(self.last_connected) >= RECONNECT_INTERVAL).then_some(Retry::Later)
+        } else if self.last_connected.is_some() && self.connection_failures == 0 {
+            Some(Retry::SlotsFull)
+        } else if self.connection_attempts == 0 {
+            Some(Retry::New)
+        } else {
+            let doublings = self
+                .connection_failures
+                .saturating_sub(1)
+                .min(RETRY_BACKOFF_MAX_DOUBLINGS);
+            let backoff = RETRY_BACKOFF_BASE * (1 << doublings);
+            (since(self.last_attempt) >= backoff).then_some(Retry::Later)
+        }
+    }
 }
 
 /// The list of nodes and connections the crawler is aware of.
@@ -114,5 +165,57 @@ impl KnownNetwork {
                 conns.remove(&conn);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_test() {
+        let now = Instant::now();
+        let ago = |secs| Some(now - Duration::from_secs(secs));
+
+        // A new address is due.
+        assert_eq!(KnownNode::default().retry(now), Some(Retry::New));
+
+        // A node that sent its Version waits out Zebra's per-IP window.
+        let handshaken = KnownNode {
+            connection_attempts: 1,
+            last_attempt: ago(130),
+            last_connected: ago(130),
+            protocol_version: Some(ProtocolVersion(170_190)),
+            ..Default::default()
+        };
+        assert_eq!(handshaken.retry(now), None);
+        let handshaken = KnownNode {
+            last_connected: ago(RECONNECT_INTERVAL.as_secs()),
+            ..handshaken
+        };
+        assert_eq!(handshaken.retry(now), Some(Retry::Later));
+
+        // A node with full inbound slots is due on every crawl loop.
+        let slots_full = KnownNode {
+            connection_attempts: 1,
+            last_attempt: ago(1),
+            last_connected: ago(1),
+            ..Default::default()
+        };
+        assert_eq!(slots_full.retry(now), Some(Retry::SlotsFull));
+
+        // A TCP failure backs off: 1 minute, then doubles up to 32 minutes.
+        let failed = |failures, secs| KnownNode {
+            connection_attempts: 1,
+            connection_failures: failures,
+            last_attempt: ago(secs),
+            ..Default::default()
+        };
+        assert_eq!(failed(1, 59).retry(now), None);
+        assert_eq!(failed(1, 60).retry(now), Some(Retry::Later));
+        assert_eq!(failed(3, 239).retry(now), None);
+        assert_eq!(failed(3, 240).retry(now), Some(Retry::Later));
+        assert_eq!(failed(u8::MAX, 32 * 60 - 1).retry(now), None);
+        assert_eq!(failed(u8::MAX, 32 * 60).retry(now), Some(Retry::Later));
     }
 }

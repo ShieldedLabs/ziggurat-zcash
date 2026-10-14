@@ -3,7 +3,7 @@ use std::{io, net::SocketAddr, sync::Arc, time::Instant};
 use chrono::Utc;
 use futures_util::SinkExt;
 use pea2pea::{
-    protocols::{Handshake, Reading, Writing},
+    protocols::{Disconnect, Handshake, Reading, Writing},
     Config, Connection, ConnectionSide, Node as Pea2PeaNode, Pea2Pea,
 };
 use tokio_util::codec::Framed;
@@ -22,7 +22,6 @@ use crate::network::ConnectionState;
 pub const NUM_CONN_ATTEMPTS_PERIODIC: usize = 500;
 pub const MAX_CONCURRENT_CONNECTIONS: u16 = 1200;
 pub const MAIN_LOOP_INTERVAL_SECS: u64 = 20;
-pub const RECONNECT_INTERVAL_SECS: u64 = 60;
 pub const MAX_WAIT_FOR_ADDR_SECS: u64 = 3 * 60;
 /// The NU7 mainnet protocol version. The crawler advertises it, so NU7 nodes keep
 /// accepting the crawler after activation (2026-11-05).
@@ -71,16 +70,26 @@ impl Crawler {
         let result = self.node.connect(addr).await;
 
         if let Some(ref mut known_node) = self.known_network.nodes.write().get_mut(&addr) {
-            match result {
+            known_node.connection_attempts += 1;
+            known_node.last_attempt = Some(timestamp);
+            match &result {
                 Ok(_) => {
                     known_node.connection_failures = 0;
                     known_node.last_connected = Some(timestamp);
                     known_node.handshake_time = Some(timestamp.elapsed());
-                    known_node.state = ConnectionState::Connected;
+                    // The peer may have closed the connection already.
+                    if self.node().is_connected(addr) {
+                        known_node.state = ConnectionState::Connected;
+                    }
                 }
-                Err(_) => {
+                Err(e) => {
                     trace!(parent: self.node().span(), "failed to connect to {}", addr);
-                    known_node.connection_failures += 1;
+                    known_node.connection_failures =
+                        known_node.connection_failures.saturating_add(1);
+                    known_node.last_failure = Some(match e.kind() {
+                        io::ErrorKind::PermissionDenied => "crawler at its connection limit".into(),
+                        _ => e.to_string(),
+                    });
                 }
             }
         }
@@ -188,6 +197,7 @@ impl Reading for Crawler {
                     known_node.services = Some(ver.services);
                     known_node.start_height = Some(ver.start_height);
                     known_node.relay = Some(ver.relay);
+                    known_node.last_failure = None;
                     let now = Utc::now();
                     known_node.first_seen.get_or_insert(now);
                     known_node.last_seen = Some(now);
@@ -219,5 +229,18 @@ impl Writing for Crawler {
 
     fn codec(&self, _addr: SocketAddr, _side: ConnectionSide) -> Self::Codec {
         Default::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl Disconnect for Crawler {
+    /// Records peers that close the connection before they send their Version message.
+    async fn handle_disconnect(&self, addr: SocketAddr) {
+        if let Some(known_node) = self.known_network.nodes.write().get_mut(&addr) {
+            if known_node.protocol_version.is_none() {
+                known_node.last_failure = Some("closed before Version".into());
+            }
+            known_node.state = ConnectionState::Disconnected;
+        }
     }
 }

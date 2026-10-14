@@ -39,7 +39,9 @@ The crawler advertises protocol version 170190 (NU7) and the user agent `/zero-c
 - `chain` is `flux` when the port is 16125, the user agent contains "flux", or `start_height` is more than 100,000 blocks from the Zcash tip. Otherwise it is `zcash`.
 - `--zcash-tip <height>` sets the tip. Without it, the tip is the median start height of Zebra and Zakura peers.
 - `--duration-secs <n>` crawls for n seconds from process start, writes the census, and exits 0.
-- On exit, the crawler prints a census summary without Flux nodes (counts by implementation and version, and the share at protocol 170190 or higher) and appends it to `crawler-log.txt`.
+- On exit, the crawler prints a census summary without Flux nodes (counts by implementation and version, and the share at protocol 170190 or higher) and appends it to `crawler-log.txt`. The summary starts with the crawl funnel (known, attempted, TCP connected, sent Version) and the top reasons nodes sent no Version.
+- Many listening nodes have full inbound slots. They accept TCP and close the connection before they send a Version. The crawler retries them on every crawl loop, because Zebra does not count a rejected attempt against our IP. It reconnects to a node that sent its Version after 5 minutes, because Zebra and Zakura drop a reconnect from the same IP within 119 seconds. Addresses that fail at the TCP level back off from 1 to 32 minutes.
+- A crawler only sees listening nodes with a free inbound slot. Coverage grows with run time, so prefer long runs. On a Mac, run under `caffeinate -i`: the run clock stops while the Mac sleeps.
 
 ## Metrics
 

@@ -20,6 +20,8 @@ pub const FLUX_P2P_PORT: u16 = 16125;
 /// A start height further than this from the Zcash tip marks a Flux node.
 /// About 87 days of Zcash blocks, so a lagging Zcash node still counts as Zcash.
 pub const TIP_TOLERANCE_BLOCKS: u32 = 100_000;
+/// The number of failure reasons the summary lists.
+const MAX_FAILURE_REASONS: usize = 8;
 
 /// The chain a node belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -148,11 +150,53 @@ impl<'a> CensusRecord<'a> {
     }
 }
 
+/// How far the crawl got with the known addresses.
+#[derive(Debug, Default, PartialEq)]
+struct Funnel<'a> {
+    known: usize,
+    attempted: usize,
+    /// TCP connected, and our Version message sent.
+    connected: usize,
+    /// Why attempted nodes sent no Version message, most common first.
+    failures: Vec<(&'a str, usize)>,
+}
+
+impl<'a> Funnel<'a> {
+    fn new(nodes: &'a HashMap<SocketAddr, KnownNode>) -> Self {
+        let mut funnel = Funnel {
+            known: nodes.len(),
+            ..Default::default()
+        };
+        let mut failures: HashMap<&str, usize> = HashMap::new();
+
+        for node in nodes.values().filter(|node| node.connection_attempts > 0) {
+            funnel.attempted += 1;
+            funnel.connected += node.last_connected.is_some() as usize;
+
+            if node.protocol_version.is_none() {
+                let reason = match (&node.last_failure, node.last_connected) {
+                    (Some(failure), _) => failure.as_str(),
+                    (None, Some(_)) => "connected, no Version yet",
+                    (None, None) => "connect in progress",
+                };
+                *failures.entry(reason).or_default() += 1;
+            }
+        }
+
+        funnel.failures = failures.into_iter().collect();
+        funnel
+            .failures
+            .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        funnel
+    }
+}
+
 /// The census of all nodes that sent their Version message.
 pub struct Census<'a> {
     /// The tip used for the height rule: the given tip, else the Zebra and Zakura median.
     zcash_tip: Option<i32>,
     records: Vec<CensusRecord<'a>>,
+    funnel: Funnel<'a>,
 }
 
 impl<'a> Census<'a> {
@@ -165,7 +209,11 @@ impl<'a> Census<'a> {
             .collect();
         records.sort_by_key(|record| (record.ip, record.port));
 
-        Self { zcash_tip, records }
+        Self {
+            zcash_tip,
+            records,
+            funnel: Funnel::new(nodes),
+        }
     }
 
     /// Writes `census-<run start>.ndjson.gz` into `dir` and returns its path.
@@ -219,6 +267,19 @@ impl fmt::Display for Census<'_> {
             num_nu7 += nu7 as usize;
         }
 
+        writeln!(
+            f,
+            "Known addresses: {}, attempted: {}, TCP connected: {}, sent Version: {}",
+            self.funnel.known,
+            self.funnel.attempted,
+            self.funnel.connected,
+            self.records.len()
+        )?;
+        writeln!(f, "Top reasons for no Version:")?;
+        for (reason, count) in self.funnel.failures.iter().take(MAX_FAILURE_REASONS) {
+            writeln!(f, "  {reason}: {count}")?;
+        }
+
         writeln!(f, "Zcash census (Flux excluded)")?;
         match self.zcash_tip {
             Some(tip) => writeln!(f, "Zcash tip for the height rule: {tip}")?,
@@ -256,7 +317,7 @@ impl fmt::Display for Census<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use chrono::TimeZone;
     use ziggurat_zcash::protocol::payload::{ProtocolVersion, VarStr};
@@ -268,6 +329,8 @@ mod tests {
     fn node(user_agent: &str, start_height: i32) -> KnownNode {
         let seen = Utc.with_ymd_and_hms(2026, 10, 12, 14, 0, 0).unwrap();
         KnownNode {
+            connection_attempts: 1,
+            last_connected: Some(Instant::now()),
             handshake_time: Some(Duration::from_millis(42)),
             protocol_version: Some(ProtocolVersion(NU7_PROTOCOL_VERSION)),
             user_agent: Some(VarStr(user_agent.into())),
@@ -344,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn zcash_tip_estimate_test() {
+    fn census_summary_test() {
         let nodes = HashMap::from([
             (
                 "192.0.2.1:8233".parse().unwrap(),
@@ -362,6 +425,16 @@ mod tests {
                 "192.0.2.4:16125".parse().unwrap(),
                 node("/MagicBean:9.0.6/", 1_900_000),
             ),
+            (
+                "192.0.2.5:8233".parse().unwrap(),
+                KnownNode {
+                    connection_attempts: 3,
+                    last_connected: Some(Instant::now()),
+                    last_failure: Some("closed before Version".into()),
+                    ..Default::default()
+                },
+            ),
+            ("192.0.2.6:8233".parse().unwrap(), KnownNode::default()),
         ]);
 
         let census = Census::new(&nodes, None);
@@ -369,10 +442,13 @@ mod tests {
         assert_eq!(census.records.len(), 4);
         assert_eq!(census.records[3].chain, Chain::Flux);
 
-        // The summary excludes the Flux node.
+        // The summary explains the funnel and excludes the Flux node.
         assert_eq!(
             census.to_string(),
-            "Zcash census (Flux excluded)\n\
+            "Known addresses: 6, attempted: 5, TCP connected: 5, sent Version: 4\n\
+             Top reasons for no Version:\n  \
+             closed before Version: 1\n\
+             Zcash census (Flux excluded)\n\
              Zcash tip for the height rule: 3500000\n\
              Nodes with a Version message: 4 (3 Zcash, 1 Flux)\n\
              Advertising protocol 170190 or higher: 3 of 3 (100.0%)\n\
