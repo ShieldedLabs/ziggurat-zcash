@@ -35,14 +35,20 @@ pub enum Chain {
 ///
 /// A node is Flux if it listens on Flux's port, names Flux in its user agent, or reports a
 /// start height far from the Zcash tip. The height rule is off when the tip is unknown.
+/// The height rule skips Zebra and Zakura: Flux forked zcashd, and a Zebra or Zakura node
+/// is far from the tip only while it syncs or after its end-of-support halt.
 pub fn classify_chain(
     port: u16,
     user_agent: &str,
     start_height: i32,
     zcash_tip: Option<i32>,
 ) -> Chain {
-    let far_from_tip =
-        zcash_tip.is_some_and(|tip| start_height.abs_diff(tip) > TIP_TOLERANCE_BLOCKS);
+    let zebra_or_zakura = matches!(
+        implementation(user_agent).0,
+        Implementation::Zebra | Implementation::Zakura
+    );
+    let far_from_tip = !zebra_or_zakura
+        && zcash_tip.is_some_and(|tip| start_height.abs_diff(tip) > TIP_TOLERANCE_BLOCKS);
 
     if port == FLUX_P2P_PORT || user_agent.to_lowercase().contains("flux") || far_from_tip {
         Chain::Flux
@@ -363,7 +369,7 @@ mod tests {
             Chain::Flux
         );
         assert_eq!(
-            classify_chain(8233, "/Zebra:4.1.0/", i32::MIN, TIP),
+            classify_chain(8233, "/MagicBean:9.0.6/", i32::MIN, TIP),
             Chain::Flux
         );
 
@@ -378,6 +384,16 @@ mod tests {
         );
         assert_eq!(
             classify_chain(8233, "/MagicBean:9.0.6/", 1_900_000, None),
+            Chain::Zcash
+        );
+
+        // Zebra and Zakura skip the height rule: syncing, or halted at end of support.
+        assert_eq!(
+            classify_chain(8233, "/Zakura:1.6.0/", 20_096, TIP),
+            Chain::Zcash
+        );
+        assert_eq!(
+            classify_chain(8233, "/Zebra:4.3.0/", 3_364_604, TIP),
             Chain::Zcash
         );
     }

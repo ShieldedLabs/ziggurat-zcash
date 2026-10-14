@@ -36,7 +36,7 @@ OPTIONS:
 The crawler advertises protocol version 170190 (NU7) and the user agent `/zero-census:0.1.0/` (change it with `--user-agent`).
 
 - `--export-dir <dir>` writes `census-<UTC start>.ndjson.gz` after each crawl interval and on exit. Each write replaces the file of the same run. The file has one JSON line per node that sent its Version message: `ip`, `port`, `protocol_version`, `user_agent`, `services`, `start_height`, `relay`, `first_seen`, `last_seen`, `handshake_ms`, `chain`.
-- `chain` is `flux` when the port is 16125, the user agent contains "flux", or `start_height` is more than 100,000 blocks from the Zcash tip. Otherwise it is `zcash`.
+- `chain` is `flux` when the port is 16125, the user agent contains "flux", or `start_height` is more than 100,000 blocks from the Zcash tip. Otherwise it is `zcash`. The height rule skips Zebra and Zakura, because Flux forked zcashd.
 - `--zcash-tip <height>` sets the tip. Without it, the tip is the median start height of Zebra and Zakura peers.
 - `--duration-secs <n>` crawls for n seconds from process start, writes the census, and exits 0.
 - On exit, the crawler prints a census summary without Flux nodes (counts by implementation and version, and the share at protocol 170190 or higher) and appends it to `crawler-log.txt`. The summary starts with the crawl funnel (known, attempted, TCP connected, sent Version) and the top reasons nodes sent no Version.
