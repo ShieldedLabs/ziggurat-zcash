@@ -1,0 +1,54 @@
+# mempool-listener config for the VPS. The [rules] values are the defaults.
+# Tune the rule thresholds after a week of data.
+
+[listener]
+# Copy a census-*.ndjson.gz from the crawler here. The listener reads it at start.
+census_dir = "/data/census"
+# Peers to use instead of the census:
+# peers = ["203.0.113.5:8233"]
+target_peers = 50
+data_dir = "/data/mempool"
+user_agent = "/zero-mempool:0.1.0/"
+metrics_addr = "0.0.0.0:9101"
+mempool_poll_secs = 60
+getdata_timeout_secs = 30
+gone_after_secs = 600
+reconnect_secs = 120
+max_failures = 1
+
+# Leave this section out to log alerts without publishing them.
+[ntfy]
+# The ntfy container. Use https://alerts.shieldedinfra.net from outside the VPS.
+url = "http://ntfy"
+topic = "mempool"
+token_env = "NTFY_TOKEN"
+
+[rules]
+cooldown_secs = 3600
+
+[rules.burst]
+count = 5
+window_secs = 600
+size_bucket_bytes = 1000
+
+[rules.under_floor]
+count = 3
+window_secs = 600
+zats_per_action = 1000
+
+[rules.depth]
+factor = 3.0
+baseline_secs = 86400
+min_samples = 60
+min_count = 100
+min_bytes = 1000000
+
+[rules.large_tx]
+bytes = 100000
+
+[rules.blind]
+quiet_secs = 1800
+
+[rules.heartbeat]
+hour = 8
+timezone = "America/New_York"

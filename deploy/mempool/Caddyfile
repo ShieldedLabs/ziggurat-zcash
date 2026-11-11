@@ -1,0 +1,3 @@
+alerts.shieldedinfra.net {
+	reverse_proxy ntfy:80
+}

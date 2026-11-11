@@ -1,0 +1,36 @@
+# Draft. Builds the mempool-listener Linux binary and attaches it to a release.
+name: mempool-listener release
+
+on:
+  push:
+    tags: ["mempool-v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Ubuntu 22.04 glibc runs on Debian bookworm.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --features mempool --bin mempool-listener
+      - name: Build
+        run: cargo build --release --features mempool --bin mempool-listener
+      - name: Package
+        run: |
+          cp target/release/mempool-listener mempool-listener-x86_64-linux
+          sha256sum mempool-listener-x86_64-linux > mempool-listener-x86_64-linux.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mempool-listener-x86_64-linux
+          path: mempool-listener-x86_64-linux*
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            mempool-listener-x86_64-linux
+            mempool-listener-x86_64-linux.sha256
