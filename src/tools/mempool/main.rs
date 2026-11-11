@@ -235,9 +235,36 @@ struct PeerInfo {
     ready_at: Option<Instant>,
     last_poll: Option<Instant>,
     awaiting_snapshot: Option<Instant>,
-    snapshot: Option<(Instant, u64)>,
+    snapshot: Option<Snapshot>,
     /// The txs this peer announced, by wtxid.
     announced: HashSet<String>,
+}
+
+/// A peer's latest `mempool` reply.
+#[derive(Clone, Copy)]
+struct Snapshot {
+    at: Instant,
+    count: u64,
+    /// Bytes of the listed txs the listener has fetched. A tx fetched after the reply
+    /// counts from the next reply.
+    bytes: u64,
+}
+
+/// The median peer's count and bytes over fresh snapshots. Each is a median of its own,
+/// so one peer with a long backlog moves neither.
+fn median_depth(
+    snapshots: impl Iterator<Item = Snapshot>,
+    now: Instant,
+    fresh: Duration,
+) -> (u64, u64) {
+    let (mut counts, mut bytes): (Vec<u64>, Vec<u64>) = snapshots
+        .filter(|s| now.duration_since(s.at) < fresh)
+        .map(|s| (s.count, s.bytes))
+        .unzip();
+    counts.sort_unstable();
+    bytes.sort_unstable();
+    let median = |v: &[u64]| v.get(v.len() / 2).copied().unwrap_or(0);
+    (median(&counts), median(&bytes))
 }
 
 struct TxEntry {
@@ -402,10 +429,8 @@ impl Core {
         }
 
         let mut lines = Vec::new();
-        if snapshot {
-            peer.snapshot = Some((now, hashes.len() as u64));
-            lines.push(("snapshot", json!({ "peer": addr, "count": hashes.len() })));
-        }
+        let count = hashes.len();
+        let mut bytes = 0;
         let src = if snapshot { "mempool" } else { "inv" };
 
         let mut new = 0;
@@ -435,6 +460,7 @@ impl Core {
             // After a restart, the first snapshots list txs the day file already has.
             let first_today = first && back.is_none() && self.seen_today.first(&ids.wtxid, today);
             entry.last_seen = now;
+            bytes += entry.size.unwrap_or(0) as u64;
             if !entry.announcers.contains(&addr) {
                 entry.announcers.push(addr);
             }
@@ -458,6 +484,21 @@ impl Core {
             if first && entry.size.is_none() {
                 fetch.push(ids.wtxid);
             }
+        }
+
+        if snapshot {
+            peer.snapshot = Some(Snapshot {
+                at: now,
+                count: count as u64,
+                bytes,
+            });
+            lines.insert(
+                0,
+                (
+                    "snapshot",
+                    json!({ "peer": addr, "count": count, "bytes": bytes }),
+                ),
+            );
         }
 
         for (event, fields) in lines {
@@ -692,8 +733,8 @@ impl Core {
         for (addr, peer) in self.connected.iter().filter(|(_, p)| p.ready_at.is_some()) {
             let count = peer
                 .snapshot
-                .filter(|(at, _)| now.duration_since(*at) < fresh)
-                .map_or(0, |(_, count)| count);
+                .filter(|s| now.duration_since(s.at) < fresh)
+                .map_or(0, |s| s.count);
             metrics::gauge!(
                 "mempool_peer_snapshot",
                 count as f64,
@@ -703,18 +744,14 @@ impl Core {
         }
     }
 
-    /// Samples the median fresh snapshot count and the bytes of fetched live txs.
+    /// Samples the median peer's mempool, and the bytes of all fetched live txs.
     fn sample_depth(&self, now: Instant) {
         let fresh = Duration::from_secs(self.config.mempool_poll_secs * 2);
-        let mut counts: Vec<u64> = self
-            .connected
-            .values()
-            .filter_map(|p| p.snapshot)
-            .filter(|(at, _)| now.duration_since(*at) < fresh)
-            .map(|(_, count)| count)
-            .collect();
-        counts.sort_unstable();
-        let count = counts.get(counts.len() / 2).copied().unwrap_or(0);
+        let (count, peer_bytes) = median_depth(
+            self.connected.values().filter_map(|p| p.snapshot),
+            now,
+            fresh,
+        );
         let bytes: u64 = self
             .txs
             .values()
@@ -722,6 +759,7 @@ impl Core {
             .map(|s| s as u64)
             .sum();
         metrics::gauge!("mempool_snapshot_median", count as f64);
+        metrics::gauge!("mempool_snapshot_median_bytes", peer_bytes as f64);
         metrics::gauge!("mempool_live_bytes", bytes as f64);
     }
 
@@ -743,6 +781,30 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_backlog_moves_no_median() {
+        let now = Instant::now();
+        let at = |count, bytes| Snapshot {
+            at: now,
+            count,
+            bytes,
+        };
+        let mut snapshots = vec![at(40, 1_000_000); 4];
+        snapshots.push(at(1_300, 9_000_000));
+        // A stale snapshot is left out.
+        snapshots.push(Snapshot {
+            at: now - Duration::from_secs(600),
+            count: 5_000,
+            bytes: 50_000_000,
+        });
+        let fresh = Duration::from_secs(120);
+        assert_eq!(
+            median_depth(snapshots.into_iter(), now, fresh),
+            (40, 1_000_000)
+        );
+        assert_eq!(median_depth(std::iter::empty(), now, fresh), (0, 0));
+    }
 
     #[test]
     fn replay_800_zat_burst() {
