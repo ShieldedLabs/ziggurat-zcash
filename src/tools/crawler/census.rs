@@ -13,7 +13,9 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use flate2::{write::GzEncoder, Compression};
 use serde::Serialize;
 
-use crate::{network::KnownNode, protocol::NU7_PROTOCOL_VERSION};
+use ziggurat_zcash::protocol::message::constants::NU7_PROTOCOL_VERSION;
+
+use crate::network::KnownNode;
 
 /// Flux's P2P port. Flux forked zcashd and answers on the Zcash mainnet magic.
 pub const FLUX_P2P_PORT: u16 = 16125;

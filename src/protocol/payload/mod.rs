@@ -200,6 +200,11 @@ impl Hash {
     pub fn zeroed() -> Self {
         Self([0; 32])
     }
+
+    /// The hash bytes, in serialized order.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 impl Codec for Hash {

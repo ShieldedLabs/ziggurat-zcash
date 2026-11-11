@@ -10,7 +10,7 @@ use tokio_util::codec::Framed;
 use tracing::*;
 use ziggurat_zcash::{
     protocol::{
-        message::Message,
+        message::{constants::NU7_PROTOCOL_VERSION, Message},
         payload::{block::Headers, Addr, VarStr, Version},
     },
     tools::synthetic_node::MessageCodec,
@@ -23,9 +23,6 @@ pub const NUM_CONN_ATTEMPTS_PERIODIC: usize = 500;
 pub const MAX_CONCURRENT_CONNECTIONS: u16 = 1200;
 pub const MAIN_LOOP_INTERVAL_SECS: u64 = 20;
 pub const MAX_WAIT_FOR_ADDR_SECS: u64 = 3 * 60;
-/// The NU7 mainnet protocol version. The crawler advertises it, so NU7 nodes keep
-/// accepting the crawler after activation (2026-11-05).
-pub const NU7_PROTOCOL_VERSION: u32 = 170_190;
 
 /// Represents the crawler together with network metrics it has collected.
 #[derive(Clone)]
