@@ -105,9 +105,14 @@ impl Default for RulesConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BurstConfig {
-    /// Fire when this many txs of one shape arrive inside the window.
+    /// The fewest txs of one shape inside the window that can fire.
     pub count: usize,
     pub window_secs: u64,
+    /// Fire only above this many times the shape's usual count per window.
+    pub factor: f64,
+    /// The usual count comes from this span before the window. No burst fires until the
+    /// listener has run this long.
+    pub baseline_secs: u64,
     /// Sizes inside the same bucket count as the same shape.
     pub size_bucket_bytes: usize,
 }
@@ -117,6 +122,8 @@ impl Default for BurstConfig {
         Self {
             count: 5,
             window_secs: 600,
+            factor: 3.0,
+            baseline_secs: 3600,
             size_bucket_bytes: 1000,
         }
     }

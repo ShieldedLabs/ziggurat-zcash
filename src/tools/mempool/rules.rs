@@ -1,6 +1,6 @@
 //! Alert rules. Pure state machines: the core and the replay mode feed them events.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
@@ -49,6 +49,9 @@ pub struct Status {
 pub struct Rules {
     config: RulesConfig,
     tz: Tz,
+    started: DateTime<Utc>,
+    counted: VecDeque<(DateTime<Utc>, String)>,
+    counted_ids: HashSet<String>,
     cooldown: HashMap<String, DateTime<Utc>>,
     burst: HashMap<String, VecDeque<DateTime<Utc>>>,
     under_floor: VecDeque<DateTime<Utc>>,
@@ -72,6 +75,9 @@ impl Rules {
         Ok(Self {
             config,
             tz,
+            started: now,
+            counted: VecDeque::new(),
+            counted_ids: HashSet::new(),
             cooldown: HashMap::new(),
             burst: HashMap::new(),
             under_floor: VecDeque::new(),
@@ -83,21 +89,46 @@ impl Rules {
     }
 
     pub fn on_tx(&mut self, t: DateTime<Utc>, tx: &TxSummary) -> Vec<Alert> {
+        // A tx can come back after a `gone`. Count it once.
+        let keep = secs(
+            self.config
+                .burst
+                .baseline_secs
+                .max(self.config.under_floor.window_secs),
+        );
+        while self.counted.front().is_some_and(|(at, _)| t - *at > keep) {
+            let (_, wtxid) = self.counted.pop_front().expect("checked above");
+            self.counted_ids.remove(&wtxid);
+        }
+        if !self.counted_ids.insert(tx.wtxid.clone()) {
+            return Vec::new();
+        }
+        self.counted.push_back((t, tx.wtxid.clone()));
+
         self.txs_since_heartbeat += 1;
         let mut alerts = Vec::new();
 
         let shape = shape_label(tx, self.config.burst.size_bucket_bytes);
         let window = secs(self.config.burst.window_secs);
+        let baseline = secs(self.config.burst.baseline_secs).max(window * 2);
         let times = self.burst.entry(shape.clone()).or_default();
         times.push_back(t);
-        while times.front().is_some_and(|&first| t - first > window) {
+        while times.front().is_some_and(|&first| t - first > baseline) {
             times.pop_front();
         }
-        let count = times.len();
+        let count = times.iter().filter(|&&at| t - at <= window).count();
+        // The shape's usual count per window, from the baseline before this window.
+        let prior = times.len() - count;
+        let usual =
+            prior as f64 * window.num_seconds() as f64 / (baseline - window).num_seconds() as f64;
         // Drop idle shapes so the map stays small.
         self.burst
-            .retain(|_, times| times.back().is_some_and(|&last| t - last <= window));
-        if count >= self.config.burst.count {
+            .retain(|_, times| times.back().is_some_and(|&last| t - last <= baseline));
+        let warm = t - self.started >= baseline;
+        if warm
+            && count >= self.config.burst.count
+            && count as f64 > self.config.burst.factor * usual
+        {
             alerts.extend(self.fire(
                 t,
                 Alert {
@@ -106,7 +137,7 @@ impl Rules {
                     priority: Priority::High,
                     title: format!("Mempool burst: {count} txs of one shape"),
                     message: format!(
-                        "{count} txs in {} min: {shape}. Latest {}",
+                        "{count} txs in {} min, usually {usual:.1}: {shape}. Latest {}",
                         self.config.burst.window_secs / 60,
                         tx.txid
                     ),
@@ -349,27 +380,49 @@ mod tests {
         Rules::new(RulesConfig::default(), at(0)).unwrap()
     }
 
+    fn rules_at(t: DateTime<Utc>) -> Rules {
+        Rules::new(RulesConfig::default(), t).unwrap()
+    }
+
     #[test]
-    fn burst_and_under_floor_fire_once() {
+    fn busy_shape_stays_quiet_and_rare_shape_bursts() {
         let mut rules = rules();
         let mut fired = Vec::new();
+        // Two hours of a common shape, 20 per 10 min.
+        for i in 0..240 {
+            fired.extend(rules.on_tx(at(i * 30), &tx(1000 + i as usize, 4_200, 0, None)));
+        }
+        assert!(fired.is_empty());
+
+        // Then 8 cheap 2-action txs in 4 min.
         for i in 0..8 {
             fired.extend(rules.on_tx(
-                at(i * 30),
+                at(7_200 + i * 30),
                 &tx(i as usize, 9_150 + i as usize, 2, Some(800)),
             ));
         }
         let names: Vec<_> = fired.iter().map(|a| a.rule).collect();
         assert_eq!(names, ["under_floor", "burst"]);
+        assert!(fired[1].message.contains("usually 0.0"));
         assert!(fired[1].message.contains("2 orchard, fee 800"));
     }
 
     #[test]
-    fn spread_out_txs_do_not_burst() {
+    fn no_burst_while_warming_up() {
         let mut rules = rules();
         for i in 0..8 {
-            let alerts = rules.on_tx(at(i * 200), &tx(i as usize, 9_150, 2, Some(10_000)));
+            let alerts = rules.on_tx(at(i * 30), &tx(i as usize, 9_150, 2, Some(10_000)));
             assert!(alerts.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_repeated_tx_counts_once() {
+        let mut rules = rules_at(at(-7_200));
+        for i in 0..3 {
+            assert!(rules
+                .on_tx(at(i * 60), &tx(7, 9_150, 2, Some(800)))
+                .is_empty());
         }
     }
 

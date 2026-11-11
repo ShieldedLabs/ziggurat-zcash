@@ -29,6 +29,8 @@ cooldown_secs = 3600
 [rules.burst]
 count = 5
 window_secs = 600
+factor = 3.0
+baseline_secs = 3600
 size_bucket_bytes = 1000
 
 [rules.under_floor]
