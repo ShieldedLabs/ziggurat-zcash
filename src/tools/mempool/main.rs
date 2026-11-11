@@ -33,6 +33,7 @@ use ziggurat_zcash::protocol::{
 use crate::{
     config::{Config, ListenerConfig},
     events::{event_line, EventLog, SeenToday, TxIds, TxSummary},
+    fetch::Fetches,
     lookup::{FeeSource, Lookup},
     node::{Listener, NodeEvent},
     peers::PeerSet,
@@ -41,6 +42,7 @@ use crate::{
 
 mod config;
 mod events;
+mod fetch;
 mod lookup;
 mod node;
 mod peers;
@@ -315,6 +317,7 @@ struct PeerInfo {
     snapshot: Option<Snapshot>,
     /// The txs this peer announced, by wtxid.
     announced: HashSet<String>,
+    fetches: Fetches,
 }
 
 /// A peer's latest `mempool` reply.
@@ -443,6 +446,7 @@ impl Core {
                         awaiting_snapshot: None,
                         snapshot: None,
                         announced: HashSet::new(),
+                        fetches: Fetches::default(),
                     },
                 );
             }
@@ -461,17 +465,18 @@ impl Core {
                 self.peers.failed(addr);
             }
             NodeEvent::Disconnected(addr) => {
-                match self.connected.remove(&addr) {
-                    Some(PeerInfo {
-                        ready_at: Some(ready_at),
-                        ..
-                    }) => {
+                let peer = self.connected.remove(&addr);
+                match peer.as_ref().and_then(|p| p.ready_at) {
+                    Some(ready_at) => {
                         let secs = now.duration_since(ready_at).as_secs();
                         self.emit("peer_down", json!({ "peer": addr, "secs": secs }));
                     }
-                    _ => self.peers.failed(addr),
+                    None => self.peers.failed(addr),
                 }
                 self.peers.dropped(addr, now);
+                for wtxid in peer.into_iter().flat_map(|p| p.fetches.into_wtxids()) {
+                    self.retry(&wtxid, now);
+                }
             }
             NodeEvent::Message(addr, Message::Inv(inv)) => self.on_inv(addr, inv, now),
             NodeEvent::Message(addr, Message::Tx(tx)) => self.on_tx(addr, tx, now),
@@ -590,26 +595,58 @@ impl Core {
         self.counts.seen += new;
         metrics::counter!("mempool_txs_seen_total", new);
         for wtxid in fetch {
-            self.request(&wtxid, addr, now);
+            self.request(wtxid, addr);
+        }
+        self.pump(addr, now);
+    }
+
+    /// Queues the tx for a getdata to the peer. `pump` sends it.
+    fn request(&mut self, wtxid: String, addr: SocketAddr) {
+        let (Some(entry), Some(peer)) = (self.txs.get_mut(&wtxid), self.connected.get_mut(&addr))
+        else {
+            return;
+        };
+        entry.tried.insert(addr);
+        peer.fetches.push(wtxid);
+    }
+
+    /// Sends the peer's queued txs in batches, while its window has room.
+    fn pump(&mut self, addr: SocketAddr, now: Instant) {
+        let Some(peer) = self.connected.get_mut(&addr) else {
+            return;
+        };
+        let txs = &mut self.txs;
+        while let Some(batch) = peer.fetches.next_batch(|wtxid| {
+            txs.get(wtxid)
+                .is_some_and(|e| e.size.is_none() && e.request.is_none())
+        }) {
+            let mut invs = Vec::with_capacity(batch.len());
+            for wtxid in &batch {
+                let entry = txs.get_mut(wtxid).expect("next_batch keeps live txs");
+                entry.request = Some((addr, now));
+                invs.push(entry.inv);
+            }
+            self.listener.send(addr, Message::GetData(Inv::new(invs)));
         }
     }
 
-    fn request(&mut self, wtxid: &str, addr: SocketAddr, now: Instant) {
-        let Some(entry) = self.txs.get_mut(wtxid) else {
+    /// Clears the tx's request, and sends the asked peer its next batch.
+    fn settle(&mut self, wtxid: &str, now: Instant) {
+        let Some((addr, _)) = self.txs.get_mut(wtxid).and_then(|e| e.request.take()) else {
             return;
         };
-        entry.request = Some((addr, now));
-        entry.tried.insert(addr);
-        self.listener
-            .send(addr, Message::GetData(Inv::new(vec![entry.inv])));
+        if let Some(peer) = self.connected.get_mut(&addr) {
+            peer.fetches.settle(wtxid);
+            self.pump(addr, now);
+        }
     }
 
     /// Asks another peer that announced the tx, or gives up.
     fn retry(&mut self, wtxid: &str, now: Instant) {
-        let Some(entry) = self.txs.get_mut(wtxid) else {
+        self.settle(wtxid, now);
+        let Some(entry) = self.txs.get(wtxid).filter(|e| e.size.is_none()) else {
             return;
         };
-        entry.request = None;
         let next = entry.announcers.iter().copied().find(|addr| {
             !entry.tried.contains(addr)
                 && self
@@ -618,7 +655,8 @@ impl Core {
                     .is_some_and(|p| p.ready_at.is_some())
         });
         if let Some(addr) = next {
-            self.request(wtxid, addr, now);
+            self.request(wtxid.to_owned(), addr);
+            self.pump(addr, now);
         }
     }
 
@@ -658,7 +696,7 @@ impl Core {
             return;
         }
         entry.size = Some(tx.raw().len());
-        entry.request = None;
+        self.settle(&ids.wtxid, now);
 
         if let Err(e) = self.log.write_raw(t, &ids.wtxid, tx.raw()) {
             error!("can't write raw tx: {e}");
@@ -836,6 +874,7 @@ impl Core {
             self.recently_gone.insert(wtxid.clone(), (now, entry.size));
             for peer in self.connected.values_mut() {
                 peer.announced.remove(&wtxid);
+                peer.fetches.settle(&wtxid);
             }
             self.emit(
                 "gone",
