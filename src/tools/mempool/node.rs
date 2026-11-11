@@ -10,13 +10,12 @@ use pea2pea::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::codec::Framed;
-use ziggurat_zcash::{
-    protocol::{
-        message::{constants::NU7_PROTOCOL_VERSION, Message},
-        payload::{block::Headers, Addr, VarStr, Version},
-    },
-    tools::synthetic_node::MessageCodec,
+use ziggurat_zcash::protocol::{
+    message::{constants::NU7_PROTOCOL_VERSION, Message},
+    payload::{block::Headers, Addr, VarStr, Version},
 };
+
+use crate::wire::{Record, WireCodec, WireLog};
 
 pub enum NodeEvent {
     /// The peer sent its Version.
@@ -33,6 +32,7 @@ pub struct Listener {
     node: Node,
     user_agent: String,
     events: UnboundedSender<NodeEvent>,
+    wire: WireLog,
 }
 
 impl Pea2Pea for Listener {
@@ -46,6 +46,7 @@ impl Listener {
         user_agent: String,
         max_connections: u16,
         events: UnboundedSender<NodeEvent>,
+        wire: WireLog,
     ) -> Self {
         let config = Config {
             name: Some("mempool".into()),
@@ -57,6 +58,7 @@ impl Listener {
             node: Node::new(config),
             user_agent,
             events,
+            wire,
         }
     }
 
@@ -72,6 +74,10 @@ impl Listener {
         let listener = self.clone();
         tokio::spawn(async move {
             if let Err(e) = listener.node.connect(addr).await {
+                listener.wire.write(Record {
+                    reason: Some(e.to_string()),
+                    ..Record::event(addr, "connect_failed")
+                });
                 let _ = listener
                     .events
                     .send(NodeEvent::ConnectFailed(addr, e.to_string()));
@@ -82,6 +88,10 @@ impl Listener {
     /// Queues a message without waiting for the write.
     pub fn send(&self, addr: SocketAddr, message: Message) {
         let _ = self.unicast(addr, message);
+    }
+
+    pub fn wire(&self) -> &WireLog {
+        &self.wire
     }
 
     pub fn is_up(&self, addr: SocketAddr) -> bool {
@@ -95,7 +105,9 @@ impl Handshake for Listener {
 
     async fn perform_handshake(&self, mut conn: Connection) -> io::Result<Connection> {
         let addr = conn.addr();
-        let mut framed = Framed::new(self.borrow_stream(&mut conn), MessageCodec::default());
+        self.wire.write(Record::event(addr, "connect"));
+        let codec = WireCodec::new(addr, self.wire.clone());
+        let mut framed = Framed::new(self.borrow_stream(&mut conn), codec);
 
         let mut version =
             Version::new(addr, ([127, 0, 0, 1], 0).into()).with_version(NU7_PROTOCOL_VERSION);
@@ -111,15 +123,19 @@ impl Handshake for Listener {
 #[async_trait::async_trait]
 impl Reading for Listener {
     type Message = Message;
-    type Codec = MessageCodec;
+    type Codec = WireCodec;
 
-    fn codec(&self, _addr: SocketAddr, _side: ConnectionSide) -> Self::Codec {
-        Default::default()
+    fn codec(&self, addr: SocketAddr, _side: ConnectionSide) -> Self::Codec {
+        WireCodec::new(addr, self.wire.clone())
     }
 
     async fn process_message(&self, source: SocketAddr, message: Message) -> io::Result<()> {
         match message {
             Message::Version(version) => {
+                self.wire.write(Record {
+                    user_agent: Some(version.user_agent.0.clone()),
+                    ..Record::event(source, "handshake")
+                });
                 self.send(source, Message::Verack);
                 let _ = self
                     .events
@@ -143,16 +159,17 @@ impl Reading for Listener {
 
 impl Writing for Listener {
     type Message = Message;
-    type Codec = MessageCodec;
+    type Codec = WireCodec;
 
-    fn codec(&self, _addr: SocketAddr, _side: ConnectionSide) -> Self::Codec {
-        Default::default()
+    fn codec(&self, addr: SocketAddr, _side: ConnectionSide) -> Self::Codec {
+        WireCodec::new(addr, self.wire.clone())
     }
 }
 
 #[async_trait::async_trait]
 impl Disconnect for Listener {
     async fn handle_disconnect(&self, addr: SocketAddr) {
+        self.wire.disconnected(addr);
         let _ = self.events.send(NodeEvent::Disconnected(addr));
     }
 }
