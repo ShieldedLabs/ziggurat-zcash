@@ -1,13 +1,14 @@
 //! Event records and the daily NDJSON files they go to.
 
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
 use chrono::{DateTime, NaiveDate, Utc};
-use flate2::{write::GzEncoder, Compression};
+use flate2::{read::MultiGzDecoder, write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tracing::warn;
@@ -137,6 +138,60 @@ impl TxSummary {
     }
 }
 
+/// The wtxids seen so far today (UTC). The listener loads them from the day's event file at
+/// start, so a restart counts each tx once a day.
+pub struct SeenToday {
+    day: NaiveDate,
+    wtxids: HashSet<String>,
+}
+
+impl SeenToday {
+    /// Reads the `seen` events of today's `mempool-YYYYMMDD.ndjson`, and of its `.gz` if
+    /// the file was compressed. Lines that don't parse, such as a cut last line, are skipped.
+    pub fn load(dir: &Path, now: DateTime<Utc>) -> io::Result<Self> {
+        let day = now.date_naive();
+        let name = format!("mempool-{}.ndjson", day.format("%Y%m%d"));
+        let mut wtxids = HashSet::new();
+        for path in [dir.join(&name), dir.join(format!("{name}.gz"))] {
+            let file = match File::open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            let reader: Box<dyn BufRead> = if path.extension().is_some_and(|e| e == "gz") {
+                Box::new(BufReader::new(MultiGzDecoder::new(file)))
+            } else {
+                Box::new(BufReader::new(file))
+            };
+            for line in reader.lines() {
+                let Ok(Value::Object(event)) = serde_json::from_str(&line?) else {
+                    continue;
+                };
+                if event.get("event").and_then(Value::as_str) == Some("seen") {
+                    if let Some(wtxid) = event.get("wtxid").and_then(Value::as_str) {
+                        wtxids.insert(wtxid.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(Self { day, wtxids })
+    }
+
+    /// True the first time a wtxid shows up today.
+    pub fn first(&mut self, wtxid: &str, now: DateTime<Utc>) -> bool {
+        let day = now.date_naive();
+        if day != self.day {
+            self.day = day;
+            self.wtxids.clear();
+        }
+        self.wtxids.insert(wtxid.to_owned())
+    }
+
+    pub fn len(&self) -> usize {
+        self.wtxids.len()
+    }
+}
+
 /// Appends events to `mempool-YYYYMMDD.ndjson` and raw txs to `raw-YYYYMMDD.ndjson.gz`.
 ///
 /// Each raw line is its own gzip member, so a crash never leaves a broken file.
@@ -188,10 +243,13 @@ impl EventLog {
         let open = |name: String| {
             OpenOptions::new()
                 .create(true)
+                .read(true)
                 .append(true)
                 .open(self.dir.join(name))
         };
-        self.events = Some(open(format!("mempool-{stamp}.ndjson"))?);
+        let mut events = open(format!("mempool-{stamp}.ndjson"))?;
+        end_line(&mut events)?;
+        self.events = Some(events);
         self.raw = Some(open(format!("raw-{stamp}.ndjson.gz"))?);
         self.day = Some(day);
 
@@ -203,6 +261,20 @@ impl EventLog {
         });
         Ok(())
     }
+}
+
+/// Ends a line that a crash cut, so the next event starts on its own line.
+fn end_line(file: &mut File) -> io::Result<()> {
+    if file.metadata()?.len() == 0 {
+        return Ok(());
+    }
+    let mut last = [0u8];
+    file.seek(SeekFrom::End(-1))?;
+    file.read_exact(&mut last)?;
+    if last[0] != b'\n' {
+        file.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 /// Gzips every `mempool-YYYYMMDD.ndjson` before `today` into `.ndjson.gz` and removes it.
@@ -297,6 +369,48 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(lines, ["{\"event\":\"alive\"}"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_restart_counts_no_tx_twice_a_day() {
+        let dir = std::env::temp_dir().join(format!("mempool-seen-{}", std::process::id()));
+        let t = DateTime::from_timestamp(1_794_418_000, 0).unwrap();
+        {
+            let mut log = EventLog::open(&dir).unwrap();
+            for wtxid in ["aa", "bb"] {
+                log.write(t, "seen", json!({ "wtxid": wtxid, "src": "inv" }))
+                    .unwrap();
+            }
+            log.write(t, "tx", json!({ "wtxid": "cc" })).unwrap();
+        }
+        let path = dir.join("mempool-20261111.ndjson");
+        // A crash cut the last line.
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"t\":1794418000,\"event\":\"seen\",\"wtx")
+            .unwrap();
+
+        let mut seen = SeenToday::load(&dir, t).unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(!seen.first("aa", t));
+        assert!(seen.first("cc", t));
+        assert!(!seen.first("cc", t));
+        // A new day starts empty.
+        assert!(seen.first("aa", t + chrono::Duration::days(1)));
+
+        // The next event after the cut line starts on its own line.
+        EventLog::open(&dir)
+            .unwrap()
+            .write(t, "seen", json!({ "wtxid": "dd" }))
+            .unwrap();
+        assert!(!SeenToday::load(&dir, t).unwrap().first("dd", t));
+
+        // After the day rolls over, the .gz still counts.
+        compress_past_events(&dir, t.date_naive().succ_opt().unwrap()).unwrap();
+        assert_eq!(SeenToday::load(&dir, t).unwrap().len(), 3);
         fs::remove_dir_all(dir).unwrap();
     }
 

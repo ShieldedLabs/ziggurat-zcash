@@ -46,7 +46,7 @@ The listener counts its alerts in `mempool_alerts_total{rule}`, and Grafana aler
 | Metric | Meaning |
 |---|---|
 | `mempool_peers_connected` | peers past the handshake |
-| `mempool_txs_seen_total` | txs seen for the first time |
+| `mempool_txs_seen_total` | txs seen for the first time today (UTC). At start the listener reads today's `seen` events, so a restart counts no tx twice |
 | `mempool_txs_fetched_total`, `mempool_txs_undecoded_total` | txs fetched, and those zebra-chain could not parse |
 | `mempool_txs_live` | txs seen in the last 10 min |
 | `mempool_snapshot_median`, `mempool_live_bytes` | median peer mempool count, bytes of fetched live txs |
@@ -60,7 +60,7 @@ One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `ev
 | Event | Meaning |
 |---|---|
 | `peer_up`, `peer_down` | a peer finished its handshake, or dropped |
-| `seen` | a peer announced a tx by gossip, or a snapshot showed a new tx |
+| `seen` | a peer announced a tx by gossip, or a snapshot showed a tx new today |
 | `snapshot` | a peer answered `mempool` with `count` ids |
 | `tx` | a fetched tx: counts, ZIP 317 actions, fee (null with transparent inputs) |
 | `tx_undecoded` | zebra-chain could not parse a tx; the raw file keeps its bytes |
