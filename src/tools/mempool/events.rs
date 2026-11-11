@@ -77,6 +77,29 @@ pub struct TxSummary {
 }
 
 impl TxSummary {
+    /// The pools a tx touches, such as `transparent+ironwood`. A small, fixed label set.
+    pub fn pools(&self) -> String {
+        let pools: Vec<&str> = [
+            (
+                self.transparent_inputs + self.transparent_outputs,
+                "transparent",
+            ),
+            (self.sprout_joinsplits, "sprout"),
+            (self.sapling_spends + self.sapling_outputs, "sapling"),
+            (self.orchard_actions, "orchard"),
+            (self.ironwood_actions, "ironwood"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(_, name)| name)
+        .collect();
+        if pools.is_empty() {
+            "none".into()
+        } else {
+            pools.join("+")
+        }
+    }
+
     pub fn new(ids: TxIds, tx: &Transaction, size: usize) -> Self {
         let fee = if tx.has_transparent_inputs() {
             None

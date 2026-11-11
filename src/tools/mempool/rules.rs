@@ -20,6 +20,17 @@ pub struct Alert {
 /// The rule names, so the metrics can start each counter at zero.
 pub const RULES: [&str; 3] = ["burst", "under_floor", "large_tx"];
 
+/// How close each per-tx rule is to firing, for the dashboard.
+#[derive(Debug, Default, PartialEq)]
+pub struct Pressure {
+    /// The busiest shape (by count over what fires) in the burst window, and what fires it.
+    pub burst_count: usize,
+    pub burst_needed: usize,
+    pub under_floor_count: usize,
+    /// The largest tx in the burst window.
+    pub largest_tx: usize,
+}
+
 pub struct Rules {
     config: RulesConfig,
     started: DateTime<Utc>,
@@ -28,6 +39,7 @@ pub struct Rules {
     cooldown: HashMap<String, DateTime<Utc>>,
     burst: HashMap<String, VecDeque<DateTime<Utc>>>,
     under_floor: VecDeque<DateTime<Utc>>,
+    sizes: VecDeque<(DateTime<Utc>, usize)>,
 }
 
 impl Rules {
@@ -40,6 +52,63 @@ impl Rules {
             cooldown: HashMap::new(),
             burst: HashMap::new(),
             under_floor: VecDeque::new(),
+            sizes: VecDeque::new(),
+        }
+    }
+
+    fn windows(&self) -> (chrono::Duration, chrono::Duration) {
+        let window = secs(self.config.burst.window_secs);
+        (
+            window,
+            secs(self.config.burst.baseline_secs).max(window * 2),
+        )
+    }
+
+    /// A shape's count inside the window, and its usual count per window from the
+    /// baseline before the window.
+    fn burst_stats(&self, times: &VecDeque<DateTime<Utc>>, t: DateTime<Utc>) -> (usize, f64) {
+        let (window, baseline) = self.windows();
+        let live = times.iter().filter(|&&at| t - at <= baseline);
+        let count = live.clone().filter(|&&at| t - at <= window).count();
+        let prior = live.count() - count;
+        let usual =
+            prior as f64 * window.num_seconds() as f64 / (baseline - window).num_seconds() as f64;
+        (count, usual)
+    }
+
+    /// The fewest txs in the window that fire Burst for a shape with this usual count.
+    fn burst_needed(&self, usual: f64) -> usize {
+        let above_usual = (self.config.burst.factor * usual).floor() as usize + 1;
+        self.config.burst.count.max(above_usual)
+    }
+
+    pub fn pressure(&self, t: DateTime<Utc>) -> Pressure {
+        let (window, _) = self.windows();
+        let (burst_count, burst_needed) = self
+            .burst
+            .values()
+            .map(|times| {
+                let (count, usual) = self.burst_stats(times, t);
+                (count, self.burst_needed(usual))
+            })
+            .max_by(|a, b| (a.0 * b.1).cmp(&(b.0 * a.1)))
+            .unwrap_or((0, self.config.burst.count));
+        let floor_window = secs(self.config.under_floor.window_secs);
+        Pressure {
+            burst_count,
+            burst_needed,
+            under_floor_count: self
+                .under_floor
+                .iter()
+                .filter(|&&at| t - at <= floor_window)
+                .count(),
+            largest_tx: self
+                .sizes
+                .iter()
+                .filter(|(at, _)| t - *at <= window)
+                .map(|(_, size)| *size)
+                .max()
+                .unwrap_or(0),
         }
     }
 
@@ -62,27 +131,24 @@ impl Rules {
 
         let mut alerts = Vec::new();
 
+        let (window, baseline) = self.windows();
+        self.sizes.push_back((t, tx.size));
+        while self.sizes.front().is_some_and(|(at, _)| t - *at > window) {
+            self.sizes.pop_front();
+        }
+
         let shape = shape_label(tx, self.config.burst.size_bucket_bytes);
-        let window = secs(self.config.burst.window_secs);
-        let baseline = secs(self.config.burst.baseline_secs).max(window * 2);
         let times = self.burst.entry(shape.clone()).or_default();
         times.push_back(t);
         while times.front().is_some_and(|&first| t - first > baseline) {
             times.pop_front();
         }
-        let count = times.iter().filter(|&&at| t - at <= window).count();
-        // The shape's usual count per window, from the baseline before this window.
-        let prior = times.len() - count;
-        let usual =
-            prior as f64 * window.num_seconds() as f64 / (baseline - window).num_seconds() as f64;
         // Drop idle shapes so the map stays small.
         self.burst
             .retain(|_, times| times.back().is_some_and(|&last| t - last <= baseline));
+        let (count, usual) = self.burst_stats(&self.burst[&shape], t);
         let warm = t - self.started >= baseline;
-        if warm
-            && count >= self.config.burst.count
-            && count as f64 > self.config.burst.factor * usual
-        {
+        if warm && count >= self.burst_needed(usual) {
             alerts.extend(self.fire(
                 t,
                 Alert {
@@ -247,6 +313,29 @@ mod tests {
         assert_eq!(names, ["under_floor", "burst"]);
         assert!(fired[1].message.contains("usually 0.0"));
         assert!(fired[1].message.contains("2 orchard, fee 800"));
+    }
+
+    #[test]
+    fn pressure_tracks_each_rule() {
+        let mut rules = rules();
+        assert_eq!(
+            rules.pressure(at(0)),
+            Pressure {
+                burst_needed: 5,
+                ..Default::default()
+            }
+        );
+        // An hour of 6 txs per 10 min sets the shape's usual count.
+        for i in 0..36 {
+            rules.on_tx(at(i * 100), &tx(100 + i as usize, 4_200, 0, None));
+        }
+        rules.on_tx(at(3_600), &tx(1, 9_150, 2, Some(800)));
+        rules.on_tx(at(3_610), &tx(2, 120_000, 2, Some(800)));
+        let p = rules.pressure(at(3_620));
+        assert_eq!((p.burst_count, p.burst_needed), (5, 19));
+        assert_eq!(p.under_floor_count, 2);
+        assert_eq!(p.largest_tx, 120_000);
+        assert_eq!(rules.pressure(at(5_000)).under_floor_count, 0);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use clap::Parser;
+use metrics_exporter_prometheus::Matcher;
 use serde_json::{json, Value};
 use tokio::{
     signal::unix::{signal, SignalKind},
@@ -47,6 +48,10 @@ const TICK: Duration = Duration::from_secs(5);
 const SNAPSHOT_REPLY: Duration = Duration::from_secs(10);
 const DEPTH_INTERVAL: Duration = Duration::from_secs(60);
 const ALIVE_INTERVAL: Duration = Duration::from_secs(3600);
+/// 999 is the last bucket under the 1,000 zats per action floor.
+const FEE_PER_ACTION_BUCKETS: [f64; 11] = [
+    100.0, 250.0, 500.0, 800.0, 999.0, 1500.0, 2500.0, 5000.0, 10_000.0, 25_000.0, 100_000.0,
+];
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -165,12 +170,28 @@ async fn run(config: Config) -> Result<(), String> {
     if let Some(addr) = listener_config.metrics_addr {
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .with_http_listener(addr)
+            .set_buckets_for_metric(
+                Matcher::Full("mempool_fee_per_action_zats".into()),
+                &FEE_PER_ACTION_BUCKETS,
+            )
+            .map_err(|e| format!("metrics buckets: {e}"))?
             .install()
             .map_err(|e| format!("metrics on {addr}: {e}"))?;
         // Start each alert counter at zero, so Prometheus sees the first alert as an increase.
         for rule in RULES {
             metrics::counter!("mempool_alerts_total", 0, "rule" => rule);
         }
+        // The thresholds, so the dashboard draws them from the config.
+        let rules = &config.rules;
+        metrics::gauge!("mempool_under_floor_needed", rules.under_floor.count as f64);
+        metrics::gauge!(
+            "mempool_fee_floor_zats_per_action",
+            rules.under_floor.zats_per_action as f64
+        );
+        metrics::gauge!(
+            "mempool_large_tx_threshold_bytes",
+            rules.large_tx.bytes as f64
+        );
         info!("metrics on http://{addr}/metrics");
     }
 
@@ -491,7 +512,13 @@ impl Core {
             error!("can't write raw tx: {e}");
         }
         self.counts.fetched += 1;
-        metrics::increment_counter!("mempool_txs_fetched_total");
+        metrics::increment_counter!("mempool_txs_fetched_total", "pools" => summary.pools());
+        if let Some(fee) = summary.fee {
+            metrics::histogram!(
+                "mempool_fee_per_action_zats",
+                fee as f64 / f64::from(summary.logical_actions)
+            );
+        }
 
         let alerts = self.rules.on_tx(t, &summary);
         self.raise(alerts);
@@ -565,6 +592,14 @@ impl Core {
         }
 
         metrics::gauge!("mempool_peers_connected", peers as f64);
+        let pressure = self.rules.pressure(Utc::now());
+        metrics::gauge!("mempool_burst_top_count", pressure.burst_count as f64);
+        metrics::gauge!("mempool_burst_top_needed", pressure.burst_needed as f64);
+        metrics::gauge!(
+            "mempool_under_floor_count",
+            pressure.under_floor_count as f64
+        );
+        metrics::gauge!("mempool_largest_tx_bytes", pressure.largest_tx as f64);
         metrics::gauge!("mempool_txs_live", self.txs.len() as f64);
         if self
             .last_alive
