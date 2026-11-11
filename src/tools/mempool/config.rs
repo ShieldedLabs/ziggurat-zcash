@@ -9,6 +9,7 @@ use serde::Deserialize;
 pub struct Config {
     pub listener: ListenerConfig,
     pub lookup: LookupConfig,
+    pub wire: WireConfig,
     pub rules: RulesConfig,
 }
 
@@ -80,6 +81,24 @@ impl Default for LookupConfig {
             per_sec: 10.0,
             timeout_secs: 120,
             max_pending: 20,
+        }
+    }
+}
+
+/// The wire log: every frame in and out, as hourly zstd NDJSON.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WireConfig {
+    /// No dir turns the wire log off.
+    pub dir: Option<PathBuf>,
+    pub zstd_level: i32,
+}
+
+impl Default for WireConfig {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            zstd_level: 9,
         }
     }
 }
@@ -183,5 +202,6 @@ mod tests {
         let config: Config = toml::from_str(text).unwrap();
         assert!(config.listener.metrics_addr.is_some());
         assert!(!config.lookup.servers.is_empty());
+        assert!(config.wire.dir.is_some());
     }
 }

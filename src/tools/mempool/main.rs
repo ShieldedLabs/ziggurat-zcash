@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use metrics_exporter_prometheus::Matcher;
 use metrics_util::MetricKindMask;
+use pea2pea::Pea2Pea;
 use serde_json::{json, Value};
 use tokio::{
     signal::unix::{signal, SignalKind},
@@ -47,6 +48,7 @@ mod lookup;
 mod node;
 mod peers;
 mod rules;
+mod wire;
 
 const TICK: Duration = Duration::from_secs(5);
 /// Zebra answers `mempool` at once, so a later inv is gossip.
@@ -263,12 +265,18 @@ async fn run(config: Config) -> Result<(), String> {
         info!("metrics on http://{addr}/metrics");
     }
 
+    let wire = match &config.wire.dir {
+        Some(dir) => wire::WireLog::open(dir, config.wire.zstd_level)
+            .map_err(|e| format!("wire log in {}: {e}", dir.display()))?,
+        None => wire::WireLog::off(),
+    };
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
     let max_connections = (listener_config.target_peers + 10).min(u16::MAX as usize) as u16;
     let listener = Listener::new(
         listener_config.user_agent.clone(),
         max_connections,
         events_tx,
+        wire,
     );
     listener.enable().await;
 
@@ -302,6 +310,9 @@ async fn run(config: Config) -> Result<(), String> {
     }
     core.finish_pending();
     core.alive("stop");
+    // Disconnect first, so each peer's `disconnect` lands before the file closes.
+    core.listener.node().shut_down().await;
+    core.listener.wire().close();
     info!("stopped");
     Ok(())
 }

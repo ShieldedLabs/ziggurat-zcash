@@ -18,6 +18,7 @@ flowchart LR
 | `compose.yml` | the listener service, on `metrics-net`, capped at 512 MB |
 | `Dockerfile` | fetches the release binary |
 | `mempool.toml` | listener config and per-tx rule thresholds |
+| `wire-upload.sh` | the hourly wire log upload |
 
 The Grafana alert rules live in `ShieldedLabs/shielded-infra` (`workspaces/metrics/grafana/alerting/mempool.yaml`). Its `workspaces/metrics/README.md` lists the host steps.
 
@@ -86,3 +87,102 @@ The listener asks the `[lookup] servers` in `mempool.toml` (public lightwalletd,
 `raw-YYYYMMDD.ndjson.gz` holds `{"wtxid","hex"}` per fetched tx. Each line is its own gzip member, so `gzcat` reads it after a crash.
 
 Replay a day through the per-tx rules: `mempool-listener --config mempool.toml --replay mempool-YYYYMMDD.ndjson.gz`. Add `--raw raw-YYYYMMDD.ndjson.gz` to look up the unknown fees first.
+
+## Wire log
+
+The wire log keeps every frame the listener sends and receives, so a question nobody has asked yet can be answered from old data. The codec copies each frame before it decodes it, so a frame that fails to decode stays in the log.
+
+One line per record, in `data/wire/wire-YYYYMMDD-HH.ndjson.zst` (UTC hours, zstd). The current hour is in a `.part` file until the hour ends. The writer flushes every 5 s, so a crash loses about that much. After a crash, the next start keeps the `.part` file's complete lines.
+
+| Field | Meaning |
+|---|---|
+| `t` | UTC time with microseconds. In: when the codec got the bytes. Out: when the codec encoded the frame, just before the write |
+| `peer` | `ip:port` |
+| `kind` | `frame`, `connect` (TCP up), `connect_failed`, `handshake` (the peer's version arrived), `disconnect` |
+| `dir` | `in` or `out` (frames only) |
+| `command`, `len` | the header's command and payload length |
+| `raw` | the whole frame as hex, header included |
+| `decode` | `ok`, the decode error, or `tx: <error>` when zebra-chain fails to parse the tx |
+| `reason` | why a connect failed or a connection ended |
+| `user_agent` | on `handshake` |
+
+A decode error ends the connection, and its `disconnect` gives the error as `reason`. Every other end gives `reason: "the connection closed, or a read failed"`: pea2pea hides the cause from the codec. A frame cut by the end of a connection keeps its bytes, with `decode: "the connection ended inside this frame"`. At stop, the listener disconnects every peer before it closes the file.
+
+### Query with DuckDB
+
+```sql
+SET TimeZone = 'UTC';
+CREATE MACRO wire(files) AS TABLE
+  SELECT * FROM read_ndjson(files, columns = {
+    t: 'TIMESTAMPTZ', peer: 'VARCHAR', kind: 'VARCHAR', dir: 'VARCHAR', command: 'VARCHAR',
+    len: 'UBIGINT', decode: 'VARCHAR', raw: 'VARCHAR', reason: 'VARCHAR', user_agent: 'VARCHAR'});
+```
+
+The file name picks the hours, so a query reads only those files.
+
+**How many ms passed between peer A and peer B announcing tx X?** Each peer's first `inv` that names the tx, with the time after the first peer. `inv` carries the txid in reverse byte order. `via` marks an `inv` that answered our `mempool` poll.
+
+```sql
+SET VARIABLE txid = '0f3d...';  -- the txid as explorers show it
+WITH frames AS (
+  FROM wire('data/wire/wire-20270101-*.ndjson.zst') WHERE kind = 'frame'
+), firsts AS (
+  SELECT peer, min(t) AS t FROM frames
+  WHERE dir = 'in' AND command = 'inv'
+    AND contains(raw, array_to_string(list_reverse(regexp_extract_all(getvariable('txid'), '..')), ''))
+  GROUP BY peer
+)
+SELECT f.peer, f.t,
+  date_diff('millisecond', min(f.t) OVER (), f.t) AS ms_after_first,
+  CASE WHEN EXISTS (
+    FROM frames m WHERE m.peer = f.peer AND m.dir = 'out' AND m.command = 'mempool'
+      AND m.t BETWEEN f.t - INTERVAL 10 SECOND AND f.t
+  ) THEN 'mempool reply' ELSE 'gossip' END AS via
+FROM firsts f ORDER BY f.t;
+```
+
+For two peers, read their rows and subtract `ms_after_first`.
+
+**What bytes did peer C send on 1 January that failed to parse?**
+
+```sql
+SELECT t, command, len, decode, raw
+FROM wire('data/wire/wire-20270101-*.ndjson.zst')
+WHERE peer = '192.0.2.10:8233' AND kind = 'frame' AND dir = 'in' AND decode <> 'ok'
+ORDER BY t;
+```
+
+`echo <raw> | xxd -r -p > frame.bin` writes one frame's bytes to a file.
+
+### What the times mean
+
+The log shows when each peer **announced** a tx to us. That is later than when the peer received it.
+
+- Zebra gossips a batch of new tx ids to a random third of its ready peers (rounded up), then waits 7 s before the next batch (zebrad 7.0.0: `broadcast_peer_count`, `PEER_GOSSIP_DELAY`). So a peer's announcement can lag its receipt by up to about 7 s, plus the batch it waited for.
+- A peer gossips each tx to us with a chance of about one in three. Otherwise we see the tx first in its reply to our `mempool` poll, up to 60 s later (`mempool_poll_secs`). `via` marks these rows.
+- `t` also includes the network delay from the peer to the listener.
+
+So the difference between two peers' `t` measures the gap between their announcements to us. Treat gaps under about 7 s as noise, and treat `mempool reply` rows as upper bounds.
+
+### Size
+
+A soak on 2026-11-11 ran this build against the 50 census peers for 2 hours, at zstd level 9 with a 16 MiB window.
+
+| Hour 19:00 UTC | Raw NDJSON | Compressed |
+|---|---|---|
+| All 60 min | 93 MB | 28.0 MB |
+| 57 quiet min, without 3 sweep batches | 28 MB | 3.4 MB |
+
+- `tx` bodies are most of the bytes. The private backlog peer's `mempool` reply each minute compresses well, because zstd finds the last minute's copy.
+- From 19:43 UTC the backlog peer listed a new batch every 6 to 7 minutes: about 1,350 new 50-input sweeps (7 KB each), with no input shared between batches. Each batch is about 8 MB compressed. The VPS saw the same batches.
+- Quiet mempool: about 3.6 MB an hour, so about 90 MB a day and about 32 GB a year.
+- While the sweep batches run: about 28 MB an hour, so about 670 MB a day and about 245 GB a year.
+- Disk on the VPS holds 14 days: about 1.3 GB quiet, about 9 GB during the sweep.
+
+### Upload
+
+`wire-upload.sh` copies the closed hours to the `shieldedlabs-mempool-wire` bucket with the AWS CLI, then deletes local hours older than 14 days. Terraform in `ShieldedLabs/shielded-infra` makes the bucket (`workspaces/mempool-wire`) and its 365-day expiry. The bucket's keys reach only that bucket's subscription.
+
+1. Fill `WIRE_S3_ENDPOINT`, `WIRE_S3_BUCKET`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in `.env` from the Terraform outputs (see `workspaces/metrics/README.md` there).
+2. Run the upload at 5 past each hour: `5 * * * * /root/mempool/wire-upload.sh >> /root/mempool/wire-upload.log 2>&1`.
+

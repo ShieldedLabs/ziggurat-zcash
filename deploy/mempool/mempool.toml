@@ -26,6 +26,12 @@ per_sec = 10.0
 timeout_secs = 120
 max_pending = 20
 
+[wire]
+# Every frame in and out, plus connect, handshake and disconnect events, as hourly
+# wire-YYYYMMDD-HH.ndjson.zst files. Remove dir to turn it off.
+dir = "/data/wire"
+zstd_level = 9
+
 [rules]
 cooldown_secs = 3600
 

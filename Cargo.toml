@@ -69,6 +69,10 @@ features = ["full"]
 version = "0.7"
 features = ["codec"]
 
+[dependencies.zstd]
+version = "0.13"
+optional = true
+
 [dependencies.tracing]
 version = "0.1"
 default-features = false
@@ -87,6 +91,7 @@ mempool = [
     "dep:prost",
     "dep:tonic",
     "dep:tonic-prost",
+    "dep:zstd",
 ]
 
 [[bin]]
