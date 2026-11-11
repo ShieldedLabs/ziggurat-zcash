@@ -1,5 +1,5 @@
-# Draft. Runs the mempool listener, a private ntfy server and Caddy for TLS.
-# Fill .env from .env.example first.
+# Runs the mempool listener. Fill .env from .env.example first.
+# Grafana on the metrics VPS scrapes :9101 over the VPC and sends the alerts.
 
 services:
   listener:
@@ -9,7 +9,6 @@ services:
         RELEASE_URL: ${RELEASE_URL}
     command: ["mempool-listener", "--config", "/etc/mempool/mempool.toml"]
     environment:
-      NTFY_TOKEN: ${NTFY_LISTENER_TOKEN}
       RUST_LOG: info
     volumes:
       - ./mempool.toml:/etc/mempool/mempool.toml:ro
@@ -17,32 +16,4 @@ services:
     ports:
       # Prometheus, on the VPC address only.
       - "${VPC_IP}:9101:9101"
-    depends_on:
-      - ntfy
     restart: unless-stopped
-
-  ntfy:
-    image: binwiederhier/ntfy:v2.11.0
-    command: serve
-    volumes:
-      - ./ntfy/server.yml:/etc/ntfy/server.yml:ro
-      - ntfy-cache:/var/cache/ntfy
-      - ntfy-auth:/var/lib/ntfy
-    restart: unless-stopped
-
-  caddy:
-    image: caddy:2.8
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-    depends_on:
-      - ntfy
-    restart: unless-stopped
-
-volumes:
-  ntfy-cache:
-  ntfy-auth:
-  caddy-data:

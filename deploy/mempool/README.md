@@ -1,52 +1,55 @@
-# Mempool listener deployment (draft)
+# Mempool listener deployment
 
-The listener connects to about 50 Zebra and Zakura peers, logs mempool gossip, and sends alerts to a private ntfy server.
+The listener connects to about 50 Zebra and Zakura peers, logs mempool gossip, and exports Prometheus metrics. Grafana on the metrics VPS alerts on them.
 
 ```mermaid
 flowchart LR
   P["Zebra/Zakura peers"] -->|inv, tx| L[listener]
   L -->|getdata, mempool| P
   L --> D["data/mempool/*.ndjson(.gz)"]
-  L -->|publish, token| N[ntfy]
-  C[caddy TLS] --> N
-  Phone -->|read token| C
-  M[Prometheus on the VPC] -->|:9101/metrics| L
+  M["Prometheus + Grafana<br/>(metrics VPS)"] -->|":9101/metrics over the VPC"| L
+  M -->|alerts| Phone
 ```
 
 ## Files
 
 | File | Use |
 |---|---|
-| `compose.yml` | listener, ntfy, caddy |
+| `compose.yml` | the listener service |
 | `Dockerfile` | fetches the release binary |
-| `mempool.toml` | listener config and rule thresholds |
-| `ntfy/server.yml` | deny-all auth, 30-day cache, ntfy.sh upstream for iOS |
-| `Caddyfile` | TLS for `alerts.shieldedinfra.net` |
+| `mempool.toml` | listener config and per-tx rule thresholds |
+
+The Grafana alert rules and the Prometheus scrape job live in `ShieldedLabs/shielded-infra` (`workspaces/mempool/README.md`).
 
 ## Set up
 
 1. Copy `.env.example` to `.env`. Set `RELEASE_URL` and `VPC_IP`.
 2. Copy a recent `census-*.ndjson.gz` from the crawler into `data/census/`.
-3. Start ntfy and caddy: `docker compose up -d ntfy caddy`.
-4. Make the users and tokens:
+3. Start the listener: `docker compose up -d`.
+4. Check the metrics from the metrics VPS: `curl http://<VPC_IP>:9101/metrics`.
 
-   ```bash
-   docker compose exec ntfy ntfy user add listener
-   docker compose exec ntfy ntfy access listener mempool write-only
-   docker compose exec ntfy ntfy token add listener
-   docker compose exec ntfy ntfy user add mark
-   docker compose exec ntfy ntfy access mark mempool read-only
-   docker compose exec ntfy ntfy token add mark
-   ```
+## Alerts
 
-5. Put the listener token in `.env` as `NTFY_LISTENER_TOKEN`. Put Mark's token in the ntfy phone app.
-6. Start the listener: `docker compose up -d listener`.
+| Alert | Where it runs | Fires when |
+|---|---|---|
+| Burst | listener | 5+ txs of one shape in 10 min, over 3x the shape's usual rate |
+| Under floor | listener | 3+ txs in 10 min pay under 1,000 zats per ZIP 317 action |
+| Large tx | listener | a tx is over 100 KB |
+| Depth, bytes | Grafana | the mempool is over 3x its 24 h median |
+| Few peers, quiet, down | Grafana | under 10 peers, no new tx for 30 min, or no scrape |
 
-## Check
+The listener counts its alerts in `mempool_alerts_total{rule}`, and Grafana alerts on that counter. The txids and shapes are in the `alert` events.
 
-- An anonymous publish fails with 401 or 403: `curl -d hi https://alerts.shieldedinfra.net/mempool`.
-- A test alert reaches the phone: `docker compose run --rm listener mempool-listener --config /etc/mempool/mempool.toml --test-alert`.
-- Hourly `alive` lines appear in `data/mempool/mempool-YYYYMMDD.ndjson`.
+## Metrics
+
+| Metric | Meaning |
+|---|---|
+| `mempool_peers_connected` | peers past the handshake |
+| `mempool_txs_seen_total` | txs seen for the first time |
+| `mempool_txs_fetched_total`, `mempool_txs_undecoded_total` | txs fetched, and those zebra-chain could not parse |
+| `mempool_txs_live` | txs seen in the last 10 min |
+| `mempool_snapshot_median`, `mempool_live_bytes` | median peer mempool count, bytes of fetched live txs |
+| `mempool_alerts_total{rule}` | per-tx rule alerts |
 
 ## Events
 
@@ -60,9 +63,9 @@ One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `ev
 | `tx` | a fetched tx: counts, ZIP 317 actions, fee (null with transparent inputs) |
 | `tx_undecoded` | zebra-chain could not parse a tx; the raw file keeps its bytes |
 | `gone` | no peer listed the tx for 10 min (mined or evicted) |
-| `alert` | a rule fired |
+| `alert` | a per-tx rule fired |
 | `alive`, `stop` | hourly counts, and the counts at shutdown |
 
 `raw-YYYYMMDD.ndjson.gz` holds `{"wtxid","hex"}` per fetched tx. Each line is its own gzip member, so `gzcat` reads it after a crash.
 
-Replay a day through the rules: `mempool-listener --config mempool.toml --replay mempool-YYYYMMDD.ndjson`.
+Replay a day through the per-tx rules: `mempool-listener --config mempool.toml --replay mempool-YYYYMMDD.ndjson`.

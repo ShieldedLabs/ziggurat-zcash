@@ -1,5 +1,6 @@
-# mempool-listener config for the VPS. The [rules] values are the defaults.
-# Tune the rule thresholds after a week of data.
+# mempool-listener config for the VPS. The rules sections hold the defaults.
+# Tune the rule thresholds after a week of data. Grafana alerts on depth, peers
+# and liveness from the metrics, and on the mempool_alerts_total{rule} counter.
 
 [listener]
 # Copy a census-*.ndjson.gz from the crawler here. The listener reads it at start.
@@ -9,19 +10,13 @@ census_dir = "/data/census"
 target_peers = 50
 data_dir = "/data/mempool"
 user_agent = "/zero-mempool:0.1.0/"
+# Prometheus scrapes this over the VPC. Compose publishes it on the VPC address only.
 metrics_addr = "0.0.0.0:9101"
 mempool_poll_secs = 60
 getdata_timeout_secs = 30
 gone_after_secs = 600
 reconnect_secs = 120
 max_failures = 1
-
-# Leave this section out to log alerts without publishing them.
-[ntfy]
-# The ntfy container. Use https://alerts.shieldedinfra.net from outside the VPS.
-url = "http://ntfy"
-topic = "mempool"
-token_env = "NTFY_TOKEN"
 
 [rules]
 cooldown_secs = 3600
@@ -38,19 +33,5 @@ count = 3
 window_secs = 600
 zats_per_action = 1000
 
-[rules.depth]
-factor = 3.0
-baseline_secs = 86400
-min_samples = 60
-min_count = 100
-min_bytes = 1000000
-
 [rules.large_tx]
 bytes = 100000
-
-[rules.blind]
-quiet_secs = 1800
-
-[rules.heartbeat]
-hour = 8
-timezone = "America/New_York"

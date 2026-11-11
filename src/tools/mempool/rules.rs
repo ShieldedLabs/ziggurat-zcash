@@ -1,91 +1,46 @@
-//! Alert rules. Pure state machines: the core and the replay mode feed them events.
+//! Per-tx alert rules. Pure state machines: the core and the replay mode feed them txs.
+//! Grafana alerts on the `mempool_alerts_total` counter, and on depth, peers and liveness.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use chrono::{DateTime, NaiveDate, Timelike, Utc};
-use chrono_tz::Tz;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::{config::RulesConfig, events::TxSummary};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Priority {
-    Low,
-    Default,
-    High,
-    Urgent,
-}
-
-impl Priority {
-    /// The ntfy priority number.
-    pub fn ntfy(self) -> u8 {
-        match self {
-            Self::Low => 2,
-            Self::Default => 3,
-            Self::High => 4,
-            Self::Urgent => 5,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Alert {
     pub rule: &'static str,
     /// The alert shape. The cooldown applies per key.
     pub key: String,
-    pub priority: Priority,
     pub title: String,
     pub message: String,
 }
 
-/// What the core knows on each tick.
-pub struct Status {
-    pub peers: usize,
-    /// Seconds since any peer announced a tx.
-    pub quiet_secs: u64,
-}
+/// The rule names, so the metrics can start each counter at zero.
+pub const RULES: [&str; 3] = ["burst", "under_floor", "large_tx"];
 
 pub struct Rules {
     config: RulesConfig,
-    tz: Tz,
     started: DateTime<Utc>,
     counted: VecDeque<(DateTime<Utc>, String)>,
     counted_ids: HashSet<String>,
     cooldown: HashMap<String, DateTime<Utc>>,
     burst: HashMap<String, VecDeque<DateTime<Utc>>>,
     under_floor: VecDeque<DateTime<Utc>>,
-    depth: VecDeque<(DateTime<Utc>, u64, u64)>,
-    heartbeat_day: Option<NaiveDate>,
-    txs_since_heartbeat: u64,
-    alerts_since_heartbeat: u64,
 }
 
 impl Rules {
-    pub fn new(config: RulesConfig, now: DateTime<Utc>) -> Result<Self, String> {
-        let tz: Tz = config
-            .heartbeat
-            .timezone
-            .parse()
-            .map_err(|e| format!("heartbeat timezone: {e}"))?;
-        // A start after the heartbeat hour waits for the next day.
-        let local = now.with_timezone(&tz);
-        let heartbeat_day = (local.hour() >= config.heartbeat.hour).then(|| local.date_naive());
-
-        Ok(Self {
+    pub fn new(config: RulesConfig, now: DateTime<Utc>) -> Self {
+        Self {
             config,
-            tz,
             started: now,
             counted: VecDeque::new(),
             counted_ids: HashSet::new(),
             cooldown: HashMap::new(),
             burst: HashMap::new(),
             under_floor: VecDeque::new(),
-            depth: VecDeque::new(),
-            heartbeat_day,
-            txs_since_heartbeat: 0,
-            alerts_since_heartbeat: 0,
-        })
+        }
     }
 
     pub fn on_tx(&mut self, t: DateTime<Utc>, tx: &TxSummary) -> Vec<Alert> {
@@ -105,7 +60,6 @@ impl Rules {
         }
         self.counted.push_back((t, tx.wtxid.clone()));
 
-        self.txs_since_heartbeat += 1;
         let mut alerts = Vec::new();
 
         let shape = shape_label(tx, self.config.burst.size_bucket_bytes);
@@ -134,7 +88,6 @@ impl Rules {
                 Alert {
                     rule: "burst",
                     key: format!("burst:{shape}"),
-                    priority: Priority::High,
                     title: format!("Mempool burst: {count} txs of one shape"),
                     message: format!(
                         "{count} txs in {} min, usually {usual:.1}: {shape}. Latest {}",
@@ -163,7 +116,6 @@ impl Rules {
                     Alert {
                         rule: "under_floor",
                         key: "under_floor".into(),
-                        priority: Priority::Default,
                         title: format!("{count} txs under the fee floor"),
                         message: format!(
                             "{count} txs in {} min pay under {} zats per action. Latest {}: fee {fee} for {} actions",
@@ -183,109 +135,10 @@ impl Rules {
                 Alert {
                     rule: "large_tx",
                     key: format!("large_tx:{}", tx.size / 10_000),
-                    priority: Priority::Default,
                     title: format!("Large tx: {} KB", tx.size / 1000),
                     message: format!("{}: {}", tx.txid, shape_label(tx, 1000)),
                 },
             ));
-        }
-
-        alerts
-    }
-
-    /// Takes one mempool sample: the median snapshot count and the known bytes.
-    pub fn on_depth(&mut self, t: DateTime<Utc>, count: u64, bytes: u64) -> Vec<Alert> {
-        let config = self.config.depth.clone();
-        let baseline_window = secs(config.baseline_secs);
-        while self
-            .depth
-            .front()
-            .is_some_and(|&(first, ..)| t - first > baseline_window)
-        {
-            self.depth.pop_front();
-        }
-
-        let mut alerts = Vec::new();
-        if self.depth.len() >= config.min_samples {
-            let base_count = median(self.depth.iter().map(|s| s.1));
-            let base_bytes = median(self.depth.iter().map(|s| s.2));
-            if count >= config.min_count && count as f64 > config.factor * base_count as f64 {
-                alerts.extend(self.fire(
-                    t,
-                    Alert {
-                        rule: "depth",
-                        key: "depth:count".into(),
-                        priority: Priority::High,
-                        title: format!("Mempool depth: {count} txs"),
-                        message: format!("{count} txs, trailing median {base_count}"),
-                    },
-                ));
-            }
-            if bytes >= config.min_bytes && bytes as f64 > config.factor * base_bytes as f64 {
-                alerts.extend(self.fire(
-                    t,
-                    Alert {
-                        rule: "depth",
-                        key: "depth:bytes".into(),
-                        priority: Priority::High,
-                        title: format!("Mempool depth: {} KB", bytes / 1000),
-                        message: format!(
-                            "{} KB of txs, trailing median {} KB",
-                            bytes / 1000,
-                            base_bytes / 1000
-                        ),
-                    },
-                ));
-            }
-        }
-        self.depth.push_back((t, count, bytes));
-        alerts
-    }
-
-    pub fn on_tick(&mut self, t: DateTime<Utc>, status: &Status) -> Vec<Alert> {
-        let mut alerts = Vec::new();
-
-        let blind = if status.peers == 0 {
-            Some("0 peers connected".to_string())
-        } else if status.quiet_secs >= self.config.blind.quiet_secs {
-            Some(format!(
-                "No tx announcements for {} min from {} peers",
-                status.quiet_secs / 60,
-                status.peers
-            ))
-        } else {
-            None
-        };
-        if let Some(message) = blind {
-            alerts.extend(self.fire(
-                t,
-                Alert {
-                    rule: "blind",
-                    key: "blind".into(),
-                    priority: Priority::Urgent,
-                    title: "Mempool listener is blind".into(),
-                    message,
-                },
-            ));
-        }
-
-        let local = t.with_timezone(&self.tz);
-        if local.hour() >= self.config.heartbeat.hour
-            && self.heartbeat_day != Some(local.date_naive())
-        {
-            self.heartbeat_day = Some(local.date_naive());
-            alerts.push(Alert {
-                rule: "heartbeat",
-                key: "heartbeat".into(),
-                priority: Priority::Low,
-                title: "Mempool listener heartbeat".into(),
-                message: format!(
-                    "{} peers, {} txs fetched, {} alerts since the last heartbeat",
-                    status.peers, self.txs_since_heartbeat, self.alerts_since_heartbeat
-                ),
-            });
-            self.txs_since_heartbeat = 0;
-            self.alerts_since_heartbeat = 0;
         }
 
         alerts
@@ -299,7 +152,6 @@ impl Rules {
             }
         }
         self.cooldown.insert(alert.key.clone(), t);
-        self.alerts_since_heartbeat += 1;
         Some(alert)
     }
 }
@@ -335,21 +187,11 @@ fn secs(n: u64) -> chrono::Duration {
     chrono::Duration::seconds(n as i64)
 }
 
-fn median(values: impl Iterator<Item = u64>) -> u64 {
-    let mut values: Vec<u64> = values.collect();
-    if values.is_empty() {
-        return 0;
-    }
-    values.sort_unstable();
-    values[values.len() / 2]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn at(secs: i64) -> DateTime<Utc> {
-        // 2026-11-11 12:00 UTC, 07:00 in New York.
         DateTime::from_timestamp(1_794_052_800 + secs, 0).unwrap()
     }
 
@@ -377,11 +219,11 @@ mod tests {
     }
 
     fn rules() -> Rules {
-        Rules::new(RulesConfig::default(), at(0)).unwrap()
+        Rules::new(RulesConfig::default(), at(0))
     }
 
     fn rules_at(t: DateTime<Utc>) -> Rules {
-        Rules::new(RulesConfig::default(), t).unwrap()
+        Rules::new(RulesConfig::default(), t)
     }
 
     #[test]
@@ -434,40 +276,5 @@ mod tests {
         assert!(rules.on_tx(at(60), &big(2)).is_empty());
         assert_eq!(rules.on_tx(at(60), &tx(3, 150_000, 2, None)).len(), 1);
         assert_eq!(rules.on_tx(at(3_700), &big(4)).len(), 1);
-    }
-
-    #[test]
-    fn depth_needs_a_baseline() {
-        let mut rules = rules();
-        assert!(rules.on_depth(at(0), 10_000, 0).is_empty());
-        for i in 1..=60 {
-            assert!(rules.on_depth(at(i * 60), 200, 400_000).is_empty());
-        }
-        let alerts = rules.on_depth(at(61 * 60), 700, 400_000);
-        assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].key, "depth:count");
-    }
-
-    #[test]
-    fn blind_and_heartbeat() {
-        let mut rules = rules();
-        let ok = Status {
-            peers: 40,
-            quiet_secs: 10,
-        };
-        assert!(rules.on_tick(at(0), &ok).is_empty());
-        let alerts = rules.on_tick(
-            at(60),
-            &Status {
-                peers: 0,
-                quiet_secs: 0,
-            },
-        );
-        assert_eq!(alerts[0].priority, Priority::Urgent);
-        // 08:00 in New York.
-        let alerts = rules.on_tick(at(3_600), &ok);
-        assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].rule, "heartbeat");
-        assert!(rules.on_tick(at(7_200), &ok).is_empty());
     }
 }

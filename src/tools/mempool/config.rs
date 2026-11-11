@@ -8,8 +8,6 @@ use serde::Deserialize;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub listener: ListenerConfig,
-    /// Alerts go to ntfy only when this section is present.
-    pub ntfy: Option<NtfyConfig>,
     pub rules: RulesConfig,
 }
 
@@ -61,31 +59,13 @@ impl Default for ListenerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NtfyConfig {
-    /// The server base URL, such as `https://alerts.shieldedinfra.net`.
-    pub url: String,
-    pub topic: String,
-    /// The environment variable that holds the publish token.
-    #[serde(default = "default_token_env")]
-    pub token_env: String,
-}
-
-fn default_token_env() -> String {
-    "NTFY_TOKEN".into()
-}
-
-#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RulesConfig {
     /// Each alert shape fires at most once per cooldown.
     pub cooldown_secs: u64,
     pub burst: BurstConfig,
     pub under_floor: UnderFloorConfig,
-    pub depth: DepthConfig,
     pub large_tx: LargeTxConfig,
-    pub blind: BlindConfig,
-    pub heartbeat: HeartbeatConfig,
 }
 
 impl Default for RulesConfig {
@@ -94,10 +74,7 @@ impl Default for RulesConfig {
             cooldown_secs: 3600,
             burst: Default::default(),
             under_floor: Default::default(),
-            depth: Default::default(),
             large_tx: Default::default(),
-            blind: Default::default(),
-            heartbeat: Default::default(),
         }
     }
 }
@@ -150,31 +127,6 @@ impl Default for UnderFloorConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct DepthConfig {
-    /// Fire when the mempool is this many times its trailing median.
-    pub factor: f64,
-    pub baseline_secs: u64,
-    /// The baseline needs this many one-minute samples before the rule fires.
-    pub min_samples: usize,
-    /// Ignore mempools smaller than these.
-    pub min_count: u64,
-    pub min_bytes: u64,
-}
-
-impl Default for DepthConfig {
-    fn default() -> Self {
-        Self {
-            factor: 3.0,
-            baseline_secs: 86_400,
-            min_samples: 60,
-            min_count: 100,
-            min_bytes: 1_000_000,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
 pub struct LargeTxConfig {
     pub bytes: usize,
 }
@@ -182,35 +134,6 @@ pub struct LargeTxConfig {
 impl Default for LargeTxConfig {
     fn default() -> Self {
         Self { bytes: 100_000 }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct BlindConfig {
-    /// Fire when no peer announced a tx for this long.
-    pub quiet_secs: u64,
-}
-
-impl Default for BlindConfig {
-    fn default() -> Self {
-        Self { quiet_secs: 1800 }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct HeartbeatConfig {
-    pub hour: u32,
-    pub timezone: String,
-}
-
-impl Default for HeartbeatConfig {
-    fn default() -> Self {
-        Self {
-            hour: 8,
-            timezone: "America/New_York".into(),
-        }
     }
 }
 
@@ -223,13 +146,12 @@ mod tests {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.listener.target_peers, 50);
         assert_eq!(config.rules.burst.count, 5);
-        assert!(config.ntfy.is_none());
     }
 
     #[test]
     fn example_config_parses() {
         let text = include_str!("../../../deploy/mempool/mempool.toml");
         let config: Config = toml::from_str(text).unwrap();
-        assert!(config.ntfy.is_some());
+        assert!(config.listener.metrics_addr.is_some());
     }
 }

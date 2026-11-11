@@ -1,4 +1,5 @@
-//! Listens to Zcash mempool gossip from many peers, logs it, and raises alerts.
+//! Listens to Zcash mempool gossip from many peers, logs it, and exports metrics.
+//! Grafana alerts on the metrics.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -15,9 +16,9 @@ use clap::Parser;
 use serde_json::{json, Value};
 use tokio::{
     signal::unix::{signal, SignalKind},
-    sync::mpsc::{self, UnboundedSender},
+    sync::mpsc,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 use ziggurat_zcash::protocol::{
     message::Message,
@@ -31,15 +32,13 @@ use crate::{
     config::{Config, ListenerConfig},
     events::{event_line, EventLog, TxIds, TxSummary},
     node::{Listener, NodeEvent},
-    ntfy::Ntfy,
     peers::PeerSet,
-    rules::{Alert, Priority, Rules, Status},
+    rules::{Alert, Rules, RULES},
 };
 
 mod config;
 mod events;
 mod node;
-mod ntfy;
 mod peers;
 mod rules;
 
@@ -48,8 +47,6 @@ const TICK: Duration = Duration::from_secs(5);
 const SNAPSHOT_REPLY: Duration = Duration::from_secs(10);
 const DEPTH_INTERVAL: Duration = Duration::from_secs(60);
 const ALIVE_INTERVAL: Duration = Duration::from_secs(3600);
-/// No blind alert while the first peers connect.
-const STARTUP_GRACE: Duration = Duration::from_secs(300);
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -61,14 +58,6 @@ struct Args {
     /// Feed the tx events of an NDJSON file through the rules, print the alerts, and exit
     #[clap(long, value_parser)]
     replay: Option<PathBuf>,
-
-    /// With --replay, also publish the alerts to ntfy
-    #[clap(long)]
-    publish: bool,
-
-    /// Publish one test alert to ntfy and exit
-    #[clap(long)]
-    test_alert: bool,
 }
 
 #[tokio::main]
@@ -82,32 +71,8 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let ntfy = config.ntfy.as_ref().map(Ntfy::new);
-
-    if args.test_alert {
-        let Some(ntfy) = ntfy else {
-            error!("the config has no [ntfy] section");
-            return ExitCode::FAILURE;
-        };
-        let alert = Alert {
-            rule: "test",
-            key: "test".into(),
-            priority: Priority::Default,
-            title: "Mempool listener test".into(),
-            message: "Test alert from mempool-listener".into(),
-        };
-        return match ntfy.publish(&alert).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                error!("publish failed: {e}");
-                ExitCode::FAILURE
-            }
-        };
-    }
-
     if let Some(path) = args.replay {
-        let ntfy = if args.publish { ntfy } else { None };
-        return match replay(&config, &path, ntfy).await {
+        return match replay(&config, &path) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 error!("replay failed: {e}");
@@ -116,7 +81,7 @@ async fn main() -> ExitCode {
         };
     }
 
-    match run(config, ntfy).await {
+    match run(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e}");
@@ -138,15 +103,10 @@ fn start_logger() {
         .init();
 }
 
-async fn replay(config: &Config, path: &Path, ntfy: Option<Ntfy>) -> io::Result<()> {
+fn replay(config: &Config, path: &Path) -> io::Result<()> {
     let lines = BufReader::new(File::open(path)?).lines();
     for (t, alert) in replay_alerts(config, lines)? {
         print!("{}", event_line(t, "alert", serde_json::to_value(&alert)?));
-        if let Some(ntfy) = &ntfy {
-            if let Err(e) = ntfy.publish(&alert).await {
-                warn!("publish failed: {e}");
-            }
-        }
     }
     Ok(())
 }
@@ -170,17 +130,14 @@ fn replay_alerts(
         let summary: TxSummary = serde_json::from_value(value)?;
         let rules = match &mut rules {
             Some(rules) => rules,
-            None => rules.insert(
-                Rules::new(config.rules.clone(), t)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
-            ),
+            None => rules.insert(Rules::new(config.rules.clone(), t)),
         };
         alerts.extend(rules.on_tx(t, &summary).into_iter().map(|a| (t, a)));
     }
     Ok(alerts)
 }
 
-async fn run(config: Config, ntfy: Option<Ntfy>) -> Result<(), String> {
+async fn run(config: Config) -> Result<(), String> {
     let listener_config = config.listener.clone();
     let candidates = if listener_config.peers.is_empty() {
         let census =
@@ -204,6 +161,10 @@ async fn run(config: Config, ntfy: Option<Ntfy>) -> Result<(), String> {
             .with_http_listener(addr)
             .install()
             .map_err(|e| format!("metrics on {addr}: {e}"))?;
+        // Start each alert counter at zero, so Prometheus sees the first alert as an increase.
+        for rule in RULES {
+            metrics::counter!("mempool_alerts_total", 0, "rule" => rule);
+        }
         info!("metrics on http://{addr}/metrics");
     }
 
@@ -217,15 +178,8 @@ async fn run(config: Config, ntfy: Option<Ntfy>) -> Result<(), String> {
     listener.enable().await;
 
     let log = EventLog::open(&listener_config.data_dir).map_err(|e| e.to_string())?;
-    let rules = Rules::new(config.rules.clone(), Utc::now())?;
-    let mut core = Core::new(
-        listener_config,
-        listener,
-        candidates,
-        log,
-        rules,
-        ntfy.map(Ntfy::spawn),
-    );
+    let rules = Rules::new(config.rules.clone(), Utc::now());
+    let mut core = Core::new(listener_config, listener, candidates, log, rules);
 
     let mut sigterm = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
     let mut tick = tokio::time::interval(TICK);
@@ -279,9 +233,6 @@ struct Core {
     txs: HashMap<String, TxEntry>,
     log: EventLog,
     rules: Rules,
-    alerts: Option<UnboundedSender<Alert>>,
-    started: Instant,
-    last_announce: Instant,
     last_depth: Instant,
     last_alive: Option<Instant>,
     counts: Counts,
@@ -294,7 +245,6 @@ impl Core {
         candidates: Vec<SocketAddr>,
         log: EventLog,
         rules: Rules,
-        alerts: Option<UnboundedSender<Alert>>,
     ) -> Self {
         let now = Instant::now();
         let peers = PeerSet::new(
@@ -311,9 +261,6 @@ impl Core {
             txs: HashMap::new(),
             log,
             rules,
-            alerts,
-            started: now,
-            last_announce: now,
             last_depth: now,
             last_alive: None,
             counts: Counts::default(),
@@ -420,7 +367,6 @@ impl Core {
             lines.push(("snapshot", json!({ "peer": addr, "count": hashes.len() })));
         }
         let src = if snapshot { "mempool" } else { "inv" };
-        self.last_announce = now;
 
         let mut fetch = Vec::new();
         for (ids, hash) in hashes {
@@ -554,9 +500,6 @@ impl Core {
             );
             self.counts.alerts += 1;
             metrics::increment_counter!("mempool_alerts_total", "rule" => alert.rule);
-            if let Some(alerts) = &self.alerts {
-                let _ = alerts.send(alert);
-            }
         }
     }
 
@@ -615,15 +558,6 @@ impl Core {
             self.sample_depth(now);
         }
 
-        if now.duration_since(self.started) >= STARTUP_GRACE {
-            let status = Status {
-                peers,
-                quiet_secs: now.duration_since(self.last_announce).as_secs(),
-            };
-            let alerts = self.rules.on_tick(Utc::now(), &status);
-            self.raise(alerts);
-        }
-
         metrics::gauge!("mempool_peers_connected", peers as f64);
         metrics::gauge!("mempool_txs_live", self.txs.len() as f64);
         if self
@@ -662,7 +596,7 @@ impl Core {
     }
 
     /// Samples the median fresh snapshot count and the bytes of fetched live txs.
-    fn sample_depth(&mut self, now: Instant) {
+    fn sample_depth(&self, now: Instant) {
         let fresh = Duration::from_secs(self.config.mempool_poll_secs * 2);
         let mut counts: Vec<u64> = self
             .connected
@@ -681,8 +615,6 @@ impl Core {
             .sum();
         metrics::gauge!("mempool_snapshot_median", count as f64);
         metrics::gauge!("mempool_live_bytes", bytes as f64);
-        let alerts = self.rules.on_depth(Utc::now(), count, bytes);
-        self.raise(alerts);
     }
 
     fn alive(&mut self, event: &str) {
