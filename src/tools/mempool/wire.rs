@@ -14,6 +14,7 @@ use std::{
     sync::{mpsc, Arc},
     thread,
     time::Duration,
+    time::Instant,
 };
 
 use bytes::BytesMut;
@@ -30,7 +31,7 @@ use ziggurat_zcash::{
     tools::synthetic_node::MessageCodec,
 };
 
-/// The writer flushes a zstd block this often, so a crash loses at most this much.
+/// The writer flushes a zstd block at least this often, so a crash loses about this much.
 const FLUSH: Duration = Duration::from_secs(5);
 /// 16 MiB, so zstd finds the snapshots that repeat each minute. DuckDB decodes up to 128 MiB.
 const WINDOW_LOG: u32 = 24;
@@ -142,6 +143,7 @@ impl WireLog {
             dir: dir.to_owned(),
             level,
             hour: None,
+            last_flush: Instant::now(),
         };
         thread::Builder::new()
             .name("wire-log".into())
@@ -165,13 +167,19 @@ impl WireLog {
         }
     }
 
-    /// Writes the `disconnect` event with the reason the codec saw, if any.
+    /// Writes the `connect` event, and forgets a reason left from an earlier connection.
+    pub fn connected(&self, peer: SocketAddr) {
+        self.reasons.lock().remove(&peer);
+        self.write(Record::event(peer, "connect"));
+    }
+
+    /// Writes the `disconnect` event with the decode error the codec saw, if any.
     pub fn disconnected(&self, peer: SocketAddr) {
         let reason = self
             .reasons
             .lock()
             .remove(&peer)
-            .unwrap_or_else(|| "read error, or the listener closed it".into());
+            .unwrap_or_else(|| "the connection closed, or a read failed".into());
         self.write(Record {
             reason: Some(reason),
             ..Record::event(peer, "disconnect")
@@ -194,6 +202,9 @@ pub struct WireCodec {
     inner: MessageCodec,
     peer: SocketAddr,
     log: WireLog,
+    /// Bytes of a frame still arriving. pea2pea never passes end of stream to the codec, so
+    /// the codec logs them when the connection drops it.
+    partial: Vec<u8>,
 }
 
 impl WireCodec {
@@ -202,6 +213,17 @@ impl WireCodec {
             inner: MessageCodec::default(),
             peer,
             log,
+            partial: Vec::new(),
+        }
+    }
+}
+
+impl Drop for WireCodec {
+    fn drop(&mut self) {
+        if !self.partial.is_empty() {
+            let reason = "the connection ended inside this frame";
+            self.log
+                .write(Record::frame(self.peer, "in", &self.partial, reason.into()));
         }
     }
 }
@@ -218,8 +240,9 @@ impl Decoder for WireCodec {
             .filter(|&n| n <= HEADER_LEN + MAX_MESSAGE_LEN && src.len() >= n)
             .map(|n| src[..n].to_vec());
         let result = self.inner.decode(src);
+        self.partial.clear();
         match &result {
-            Ok(None) => {}
+            Ok(None) => self.partial.extend_from_slice(src),
             Ok(Some(message)) => {
                 let decode = match message {
                     Message::Tx(tx) => tx
@@ -239,22 +262,6 @@ impl Decoder for WireCodec {
             }
         }
         result
-    }
-
-    fn decode_eof(&mut self, src: &mut BytesMut) -> io::Result<Option<Message>> {
-        if let Some(message) = self.decode(src)? {
-            return Ok(Some(message));
-        }
-        if src.is_empty() {
-            self.log
-                .stopped(self.peer, "the peer closed the connection".into());
-            return Ok(None);
-        }
-        let reason = "the peer closed the connection inside a frame";
-        self.log
-            .write(Record::frame(self.peer, "in", src, reason.into()));
-        self.log.stopped(self.peer, reason.into());
-        Err(io::Error::new(io::ErrorKind::UnexpectedEof, reason))
     }
 }
 
@@ -279,6 +286,7 @@ struct Writer {
     level: i32,
     /// The open hour, its `.part` path, and its encoder.
     hour: Option<(String, PathBuf, zstd::Encoder<'static, File>)>,
+    last_flush: Instant,
 }
 
 impl Writer {
@@ -288,6 +296,12 @@ impl Writer {
                 Ok(Msg::Record(record)) => {
                     if let Err(e) = self.write(&record) {
                         error!("can't write the wire log: {e}");
+                    }
+                    // Records rarely pause for FLUSH, so flush on time as well.
+                    if self.last_flush.elapsed() >= FLUSH {
+                        if let Err(e) = self.flush(Utc::now()) {
+                            error!("can't flush the wire log: {e}");
+                        }
                     }
                 }
                 Ok(Msg::Close(done)) => {
@@ -330,6 +344,7 @@ impl Writer {
 
     /// Flushes a block, and closes the hour once it has passed, even with no new records.
     fn flush(&mut self, now: DateTime<Utc>) -> io::Result<()> {
+        self.last_flush = Instant::now();
         match &mut self.hour {
             Some((key, ..)) if *key != hour_key(now) => self.close(),
             Some((.., encoder)) => encoder.flush(),
@@ -352,30 +367,47 @@ fn hour_key(t: DateTime<Utc>) -> String {
 }
 
 /// Moves a closed `.part` to its final name. A restart inside the hour already left a
-/// file there, so append: DuckDB reads concatenated zstd frames.
+/// file there, so join them: DuckDB reads concatenated zstd frames. The join goes to a
+/// `.tmp` file first, so a crash leaves the published file whole.
 fn publish(part: &Path) -> io::Result<()> {
     let done = part.with_extension("");
     if done.exists() {
-        let mut out = OpenOptions::new().append(true).open(&done)?;
+        let tmp = part.with_extension("tmp");
+        let mut out = File::create(&tmp)?;
+        io::copy(&mut File::open(&done)?, &mut out)?;
         io::copy(&mut File::open(part)?, &mut out)?;
         out.sync_all()?;
-        fs::remove_file(part)
+        fs::rename(&tmp, &done)?;
     } else {
-        fs::rename(part, done)
+        fs::rename(part, &done)?;
     }
+    fs::remove_file(part).or_else(|e| match e.kind() {
+        io::ErrorKind::NotFound => Ok(()),
+        _ => Err(e),
+    })
 }
 
 /// Re-encodes the complete lines of each `.part` that a crash left, then publishes it.
 fn recover(dir: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let part = entry?.path();
-        if part.extension().is_none_or(|e| e != "part") {
-            continue;
-        }
+    let paths = fs::read_dir(dir)?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    // A join that a crash cut. The published file is still whole. Clear these first, since
+    // publish below reuses the name.
+    for tmp in paths
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "tmp"))
+    {
+        fs::remove_file(tmp)?;
+    }
+    for part in paths
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "part"))
+    {
         let fixed = part.with_extension("fixed");
         let mut lines = 0;
         {
-            let mut decoder = BufReader::new(zstd::Decoder::new(File::open(&part)?)?);
+            let mut decoder = BufReader::new(zstd::Decoder::new(File::open(part)?)?);
             let mut encoder = zstd::Encoder::new(File::create(&fixed)?, 3)?;
             let mut line = Vec::new();
             loop {
@@ -392,8 +424,8 @@ fn recover(dir: &Path) -> io::Result<()> {
             encoder.finish()?.sync_all()?;
         }
         warn!("recovered {lines} wire log lines from {}", part.display());
-        fs::rename(&fixed, &part)?;
-        publish(&part)?;
+        fs::rename(&fixed, part)?;
+        publish(part)?;
     }
     Ok(())
 }
@@ -486,22 +518,72 @@ mod tests {
             .contains("Unknown command"));
         assert_eq!(lines[4]["raw"], hex::encode(&bad));
         assert!(lines[5]["reason"].as_str().unwrap().starts_with("decode:"));
+        // The next connection to the peer starts without an old reason.
+        log.stopped(peer, "stale".into());
+        log.connected(peer);
+        assert!(log.reasons.lock().is_empty());
         // Microseconds: 2026-11-11T16:00:00.123456Z
         assert_eq!(lines[0]["t"].as_str().unwrap().len(), 27);
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn a_cut_frame_at_eof_ends_the_stream() {
-        let log = WireLog::off();
+    fn a_frame_cut_by_a_disconnect_is_kept() {
+        let dir = temp_dir("cut");
+        let log = WireLog::open(&dir, 3).unwrap();
         let peer: SocketAddr = "192.0.2.1:8233".parse().unwrap();
-        let mut codec = WireCodec::new(peer, log);
         let mut wire = BytesMut::new();
-        codec
+        WireCodec::new(peer, WireLog::off())
             .encode(Message::GetData(Inv::new(Vec::new())), &mut wire)
             .unwrap();
+        let sent = wire.to_vec();
         wire.truncate(wire.len() - 1);
-        assert!(codec.decode_eof(&mut wire).is_err());
+
+        let mut codec = WireCodec::new(peer, log.clone());
+        assert!(matches!(codec.decode(&mut wire), Ok(None)));
+        // The reading task drops the codec when the connection ends.
+        drop(codec);
+        log.close();
+
+        let path = dir.join(
+            fs::read_dir(&dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .file_name(),
+        );
+        let lines = read_lines(&path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["raw"], hex::encode(&sent[..sent.len() - 1]));
+        assert_eq!(lines[0]["command"], "getdata");
+        assert!(lines[0]["decode"]
+            .as_str()
+            .unwrap()
+            .contains("inside this frame"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_join_cut_by_a_crash_leaves_the_hour_whole() {
+        let dir = temp_dir("join");
+        fs::create_dir_all(&dir).unwrap();
+        let done = dir.join("wire-20261111-16.ndjson.zst");
+        fs::write(&done, zstd::encode_all(&b"{\"a\":0}\n"[..], 3).unwrap()).unwrap();
+        // A crash during the join left a cut .tmp and the .part.
+        fs::write(dir.join("wire-20261111-16.ndjson.zst.tmp"), b"cut").unwrap();
+        let part = dir.join("wire-20261111-16.ndjson.zst.part");
+        fs::write(&part, zstd::encode_all(&b"{\"a\":1}\n"[..], 3).unwrap()).unwrap();
+
+        recover(&dir).unwrap();
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [done.file_name().unwrap()]);
+        let values: Vec<_> = read_lines(&done).iter().map(|l| l["a"].clone()).collect();
+        assert_eq!(values, [0, 1]);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

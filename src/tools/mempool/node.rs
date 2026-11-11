@@ -105,7 +105,7 @@ impl Handshake for Listener {
 
     async fn perform_handshake(&self, mut conn: Connection) -> io::Result<Connection> {
         let addr = conn.addr();
-        self.wire.write(Record::event(addr, "connect"));
+        self.wire.connected(addr);
         let codec = WireCodec::new(addr, self.wire.clone());
         let mut framed = Framed::new(self.borrow_stream(&mut conn), codec);
 

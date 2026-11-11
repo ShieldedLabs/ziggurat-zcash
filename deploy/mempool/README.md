@@ -92,7 +92,7 @@ Replay a day through the per-tx rules: `mempool-listener --config mempool.toml -
 
 The wire log keeps every frame the listener sends and receives, so a question nobody has asked yet can be answered from old data. The codec copies each frame before it decodes it, so a frame that fails to decode stays in the log.
 
-One line per record, in `data/wire/wire-YYYYMMDD-HH.ndjson.zst` (UTC hours, zstd). The current hour is in a `.part` file until the hour ends. After a crash, the next start keeps the `.part` file's complete lines.
+One line per record, in `data/wire/wire-YYYYMMDD-HH.ndjson.zst` (UTC hours, zstd). The current hour is in a `.part` file until the hour ends. The writer flushes every 5 s, so a crash loses about that much. After a crash, the next start keeps the `.part` file's complete lines.
 
 | Field | Meaning |
 |---|---|
@@ -106,7 +106,7 @@ One line per record, in `data/wire/wire-YYYYMMDD-HH.ndjson.zst` (UTC hours, zstd
 | `reason` | why a connect failed or a connection ended |
 | `user_agent` | on `handshake` |
 
-A decode error ends the connection. The codec sees a decode error or the peer closing. Other read errors give `reason: "read error, or the listener closed it"`.
+A decode error ends the connection, and its `disconnect` gives the error as `reason`. Every other end gives `reason: "the connection closed, or a read failed"`: pea2pea hides the cause from the codec. A frame cut by the end of a connection keeps its bytes, with `decode: "the connection ended inside this frame"`. At stop, the listener disconnects every peer before it closes the file.
 
 ### Query with DuckDB
 

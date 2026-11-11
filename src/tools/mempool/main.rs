@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use metrics_exporter_prometheus::Matcher;
 use metrics_util::MetricKindMask;
+use pea2pea::Pea2Pea;
 use serde_json::{json, Value};
 use tokio::{
     signal::unix::{signal, SignalKind},
@@ -307,6 +308,8 @@ async fn run(config: Config) -> Result<(), String> {
     }
     core.finish_pending();
     core.alive("stop");
+    // Disconnect first, so each peer's `disconnect` lands before the file closes.
+    core.listener.node().shut_down().await;
     core.listener.wire().close();
     info!("stopped");
     Ok(())
