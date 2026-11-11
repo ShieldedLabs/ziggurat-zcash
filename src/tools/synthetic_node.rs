@@ -25,7 +25,7 @@ use tracing::*;
 
 use crate::{
     protocol::{
-        message::{Message, MessageHeader},
+        message::{constants::MAX_MESSAGE_LEN, Message, MessageHeader},
         payload::{codec::Codec, Nonce, Version},
     },
     tools::message_filter::{Filter, MessageFilter},
@@ -486,9 +486,7 @@ impl Default for MessageCodec {
                 .length_field_offset(16)
                 .little_endian()
                 .num_skip(0)
-                // The biggest currently observed frame was 627412 bytes long, so taking some reserve
-                // to catch frames up to 1MB.
-                .max_frame_length(1048576)
+                .max_frame_length(MAX_MESSAGE_LEN)
                 .new_codec(),
         }
     }

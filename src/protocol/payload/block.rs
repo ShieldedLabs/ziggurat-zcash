@@ -607,9 +607,9 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn testnet_1599200_round_trip() {
-        // Canopy.
-        let block_bytes = &BLOCK_TESTNET_1_599_200_BYTES[..];
+    fn testnet_1842421_round_trip() {
+        // NU5.
+        let block_bytes = &BLOCK_TESTNET_1_842_421_BYTES[..];
         let mut bytes = Cursor::new(block_bytes);
 
         let mut buffer = Vec::new();
@@ -623,9 +623,9 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn testnet_1599201_round_trip() {
-        // Canopy.
-        let block_bytes = &BLOCK_TESTNET_1_599_201_BYTES[..];
+    fn testnet_1842432_round_trip() {
+        // NU5.
+        let block_bytes = &BLOCK_TESTNET_1_842_432_BYTES[..];
         let mut bytes = Cursor::new(block_bytes);
 
         let mut buffer = Vec::new();

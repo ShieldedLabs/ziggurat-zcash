@@ -199,7 +199,7 @@ impl Message {
             INV_COMMAND => Self::Inv(Inv::decode(bytes)?),
             NOTFOUND_COMMAND => Self::NotFound(Inv::decode(bytes)?),
             MEMPOOL_COMMAND => Self::MemPool,
-            TX_COMMAND => Self::Tx(Tx::decode(bytes)?),
+            TX_COMMAND => Self::Tx(Tx::decode_payload(bytes)),
             REJECT_COMMAND => Self::Reject(Reject::decode(bytes)?),
             // Explicitly ignore alert messages since they are deprecated.
             ALERT_COMMAND => {

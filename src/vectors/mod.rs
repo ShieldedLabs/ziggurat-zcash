@@ -57,10 +57,13 @@ lazy_static! {
     /// Testnet block at height `1599199` (last canopy).
     pub static ref BLOCK_TESTNET_1_599_199_BYTES: Vec<u8> =
         <Vec<u8>>::from_hex(include_str!("block-test-1-599-199.txt").trim()).unwrap();
-    /// Testnet block at height `1599200` (first nu5).
-    pub static ref BLOCK_TESTNET_1_599_200_BYTES: Vec<u8> =
-        <Vec<u8>>::from_hex(include_str!("block-test-1-599-200.txt").trim()).unwrap();
-    /// Testnet block at height `1599200` (second nu5).
-    pub static ref BLOCK_TESTNET_1_599_201_BYTES: Vec<u8> =
-        <Vec<u8>>::from_hex(include_str!("block-test-1-599-201.txt").trim()).unwrap();
+    /// Testnet block at height `1842421` (nu5).
+    pub static ref BLOCK_TESTNET_1_842_421_BYTES: Vec<u8> =
+        <Vec<u8>>::from_hex(include_str!("block-test-1-842-421.txt").trim()).unwrap();
+    /// Testnet block at height `1842432` (nu5).
+    pub static ref BLOCK_TESTNET_1_842_432_BYTES: Vec<u8> =
+        <Vec<u8>>::from_hex(include_str!("block-test-1-842-432.txt").trim()).unwrap();
+    /// Mainnet block at height `3562040` (NU6.3, V5 and V6 txs, one Ironwood tx).
+    pub static ref BLOCK_MAINNET_3_562_040_BYTES: Vec<u8> =
+        <Vec<u8>>::from_hex(include_str!("block-main-3-562-040.txt").trim()).unwrap();
 }
