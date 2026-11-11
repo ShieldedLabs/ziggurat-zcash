@@ -1,10 +1,10 @@
-# Draft. Builds the mempool-listener Linux binary and attaches it to a release.
+# Builds the mempool-listener Linux binary and attaches it to a release.
+# Shell steps only: the runner's git, rustup and gh replace the JavaScript actions.
 name: mempool-listener release
 
 on:
   push:
     tags: ["mempool-v*"]
-  workflow_dispatch:
 
 jobs:
   build:
@@ -12,25 +12,26 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ASSET: mempool-listener-x86_64-linux
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Check out
+        run: |
+          git init -q .
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git fetch -q --depth 1 origin "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Test
         run: cargo test --features mempool --bin mempool-listener
       - name: Build
         run: cargo build --release --features mempool --bin mempool-listener
-      - name: Package
+      - name: Release
         run: |
-          cp target/release/mempool-listener mempool-listener-x86_64-linux
-          sha256sum mempool-listener-x86_64-linux > mempool-listener-x86_64-linux.sha256
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mempool-listener-x86_64-linux
-          path: mempool-listener-x86_64-linux*
-      - uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: |
-            mempool-listener-x86_64-linux
-            mempool-listener-x86_64-linux.sha256
+          cp target/release/mempool-listener "$ASSET"
+          sha256sum "$ASSET" > "$ASSET.sha256"
+          gh release create "$GITHUB_REF_NAME" "$ASSET" "$ASSET.sha256" \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --notes "mempool-listener ${GITHUB_REF_NAME#mempool-v}, built from $GITHUB_SHA."
