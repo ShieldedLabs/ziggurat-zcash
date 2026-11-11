@@ -15,6 +15,8 @@ use tracing::warn;
 use zebra_chain::transaction::{zip317, Transaction};
 use ziggurat_zcash::protocol::payload::{inv::InvHash, Hash};
 
+use crate::lookup::FeeSource;
+
 /// The ids of a tx, in the byte order explorers show.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TxIds {
@@ -68,8 +70,10 @@ pub struct TxSummary {
     pub ironwood_actions: usize,
     /// ZIP 317 logical actions, at least 2.
     pub logical_actions: u32,
-    /// Exact when the tx has no transparent inputs, else `None` (needs a UTXO lookup).
+    /// `None` when `fee_source` is unknown.
     pub fee: Option<i64>,
+    #[serde(default)]
+    pub fee_source: FeeSource,
     pub sapling_value_balance: i64,
     pub orchard_value_balance: i64,
     pub ironwood_value_balance: i64,
@@ -101,14 +105,17 @@ impl TxSummary {
         }
     }
 
+    /// The fee is known here only without transparent inputs. The lookup fills in the rest.
     pub fn new(ids: TxIds, tx: &Transaction, size: usize) -> Self {
-        let fee = if tx.has_transparent_inputs() {
-            None
+        let (fee, fee_source) = if tx.has_transparent_inputs() {
+            (None, FeeSource::Unknown)
         } else {
-            tx.value_balance(&Default::default())
+            let fee = tx
+                .value_balance(&Default::default())
                 .ok()
                 .and_then(|balance| balance.remaining_transaction_value().ok())
-                .map(i64::from)
+                .map(i64::from);
+            (fee, FeeSource::Shielded)
         };
 
         Self {
@@ -125,6 +132,7 @@ impl TxSummary {
             ironwood_actions: tx.ironwood_actions().count(),
             logical_actions: zip317::conventional_actions(tx),
             fee,
+            fee_source,
             sapling_value_balance: tx.sapling_value_balance().sapling_amount().into(),
             orchard_value_balance: tx.orchard_value_balance().orchard_amount().into(),
             ironwood_value_balance: tx.ironwood_value_balance().ironwood_amount().into(),

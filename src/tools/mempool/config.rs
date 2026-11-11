@@ -8,6 +8,7 @@ use serde::Deserialize;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub listener: ListenerConfig,
+    pub lookup: LookupConfig,
     pub rules: RulesConfig,
 }
 
@@ -54,6 +55,31 @@ impl Default for ListenerConfig {
             gone_after_secs: 600,
             reconnect_secs: 120,
             max_failures: 1,
+        }
+    }
+}
+
+/// Fees for txs with transparent inputs, from the spent outputs' parent txs on lightwalletd.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LookupConfig {
+    /// lightwalletd gRPC URLs, used in turn. Empty turns lookups off.
+    pub servers: Vec<String>,
+    /// Calls per second, over all servers.
+    pub per_sec: f64,
+    /// A tx whose parents take longer than this gets `fee_source: unknown`.
+    pub timeout_secs: u64,
+    /// Txs that wait for lookups at once. More get `fee_source: unknown` at once.
+    pub max_pending: usize,
+}
+
+impl Default for LookupConfig {
+    fn default() -> Self {
+        Self {
+            servers: Vec::new(),
+            per_sec: 10.0,
+            timeout_secs: 120,
+            max_pending: 20,
         }
     }
 }
@@ -156,5 +182,6 @@ mod tests {
         let text = include_str!("../../../deploy/mempool/mempool.toml");
         let config: Config = toml::from_str(text).unwrap();
         assert!(config.listener.metrics_addr.is_some());
+        assert!(!config.lookup.servers.is_empty());
     }
 }

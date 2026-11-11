@@ -33,6 +33,7 @@ use ziggurat_zcash::protocol::{
 use crate::{
     config::{Config, ListenerConfig},
     events::{event_line, EventLog, SeenToday, TxIds, TxSummary},
+    lookup::{FeeSource, Lookup},
     node::{Listener, NodeEvent},
     peers::PeerSet,
     rules::{Alert, Rules, RULES},
@@ -40,6 +41,7 @@ use crate::{
 
 mod config;
 mod events;
+mod lookup;
 mod node;
 mod peers;
 mod rules;
@@ -52,6 +54,8 @@ const ALIVE_INTERVAL: Duration = Duration::from_secs(3600);
 /// A tx that returns this soon after `gone` is the same tx, not a new one.
 const GONE_MEMORY: Duration = Duration::from_secs(3600);
 const GAUGE_IDLE: Duration = Duration::from_secs(300);
+/// The lookup's cache of parent output values, in the data dir.
+const PREVOUTS: &str = "prevouts.ndjson";
 /// 999 is the last bucket under the 1,000 zats per action floor.
 const FEE_PER_ACTION_BUCKETS: [f64; 11] = [
     100.0, 250.0, 500.0, 800.0, 999.0, 1500.0, 2500.0, 5000.0, 10_000.0, 25_000.0, 100_000.0,
@@ -67,6 +71,10 @@ struct Args {
     /// Feed the tx events of an NDJSON file (or .ndjson.gz) through the rules, print the alerts, and exit
     #[clap(long, value_parser)]
     replay: Option<PathBuf>,
+
+    /// With --replay: the day's raw file, so the lookup can fill in unknown fees
+    #[clap(long, value_parser, requires = "replay")]
+    raw: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -81,7 +89,7 @@ async fn main() -> ExitCode {
         }
     };
     if let Some(path) = args.replay {
-        return match replay(&config, &path) {
+        return match replay(&config, &path, args.raw.as_deref()).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 error!("replay failed: {e}");
@@ -106,33 +114,65 @@ fn start_logger() {
         .add_directive("tokio_util=off".parse().unwrap())
         .add_directive("mio=off".parse().unwrap())
         .add_directive("pea2pea=warn".parse().unwrap());
+    // Replay prints its alerts on stdout, so logs go to stderr.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .with_target(false)
         .init();
 }
 
-fn replay(config: &Config, path: &Path) -> io::Result<()> {
+fn read_lines(path: &Path) -> io::Result<io::Lines<Box<dyn BufRead>>> {
     let file = File::open(path)?;
     let reader: Box<dyn BufRead> = if path.extension().is_some_and(|e| e == "gz") {
         Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(file)))
     } else {
         Box::new(BufReader::new(file))
     };
-    let lines = reader.lines();
-    for (t, alert) in replay_alerts(config, lines)? {
+    Ok(reader.lines())
+}
+
+async fn replay(config: &Config, path: &Path, raw: Option<&Path>) -> io::Result<()> {
+    let mut txs = HashMap::new();
+    if let Some(raw) = raw {
+        for line in read_lines(raw)? {
+            let value: Value = serde_json::from_str(&line?)?;
+            if let (Some(wtxid), Some(hex)) = (value["wtxid"].as_str(), value["hex"].as_str()) {
+                let bytes =
+                    hex::decode(hex).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                txs.insert(wtxid.to_owned(), bytes);
+            }
+        }
+    }
+    let lookup = match raw {
+        Some(_) => Lookup::new(&config.lookup, &config.listener.data_dir.join(PREVOUTS))
+            .map_err(io::Error::other)?,
+        None => None,
+    };
+    let replay = Replay { txs, lookup };
+    for (t, alert) in replay_alerts(config, read_lines(path)?, &replay).await? {
         print!("{}", event_line(t, "alert", serde_json::to_value(&alert)?));
     }
     Ok(())
 }
 
+/// What a replay needs to fill in unknown fees.
+#[derive(Default)]
+struct Replay {
+    /// Raw tx bytes by wtxid.
+    txs: HashMap<String, Vec<u8>>,
+    lookup: Option<Lookup>,
+}
+
 /// Feeds the `tx` events of NDJSON lines through fresh rules.
-fn replay_alerts(
+async fn replay_alerts(
     config: &Config,
     lines: impl Iterator<Item = io::Result<String>>,
+    replay: &Replay,
 ) -> io::Result<Vec<(DateTime<Utc>, Alert)>> {
     let mut rules: Option<Rules> = None;
     let mut alerts = Vec::new();
+    let mut sources: HashMap<FeeSource, u64> = HashMap::new();
     for line in lines {
         let value: Value = serde_json::from_str(&line?)?;
         if value["event"] != "tx" {
@@ -142,14 +182,40 @@ fn replay_alerts(
             .as_i64()
             .and_then(|t| DateTime::from_timestamp(t, 0))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad t"))?;
-        let summary: TxSummary = serde_json::from_value(value)?;
+        let mut summary: TxSummary = serde_json::from_value(value)?;
+        if summary.fee.is_none() {
+            let tx = replay
+                .txs
+                .get(&summary.wtxid)
+                .map(|raw| Tx::from_raw(raw.clone()));
+            if let (Some(lookup), Some(parsed)) =
+                (&replay.lookup, tx.as_ref().and_then(Tx::transaction))
+            {
+                if let Err(e) = set_fee(&mut summary, lookup.fee(parsed).await) {
+                    debug!("{}: {e}", summary.txid);
+                }
+            }
+        } else if summary.fee_source == FeeSource::Unknown {
+            // Logs from before fee_source only had shielded fees.
+            summary.fee_source = FeeSource::Shielded;
+        }
+        *sources.entry(summary.fee_source).or_default() += 1;
         let rules = match &mut rules {
             Some(rules) => rules,
             None => rules.insert(Rules::new(config.rules.clone(), t)),
         };
         alerts.extend(rules.on_tx(t, &summary).into_iter().map(|a| (t, a)));
     }
+    info!("fee sources: {sources:?}");
     Ok(alerts)
+}
+
+/// Records a lookup's fee. Returns the lookup's error.
+fn set_fee(summary: &mut TxSummary, fee: Result<i64, String>) -> Result<(), String> {
+    let fee = fee?;
+    summary.fee = Some(fee);
+    summary.fee_source = FeeSource::Lookup;
+    Ok(())
 }
 
 async fn run(config: Config) -> Result<(), String> {
@@ -189,6 +255,9 @@ async fn run(config: Config) -> Result<(), String> {
         }
         metrics::counter!("mempool_txs_seen_total", 0);
         metrics::counter!("mempool_txs_undecoded_total", 0);
+        for result in ["ok", "error"] {
+            metrics::counter!("mempool_fee_lookups_total", 0, "result" => result);
+        }
         info!("metrics on http://{addr}/metrics");
     }
 
@@ -206,6 +275,8 @@ async fn run(config: Config) -> Result<(), String> {
     let seen_today =
         SeenToday::load(&listener_config.data_dir, Utc::now()).map_err(|e| e.to_string())?;
     info!("{} txs seen earlier today", seen_today.len());
+    let lookup = Lookup::new(&config.lookup, &listener_config.data_dir.join(PREVOUTS))?;
+    let (fees_tx, mut fees_rx) = mpsc::unbounded_channel();
     let mut core = Core::new(
         listener_config,
         listener,
@@ -214,21 +285,27 @@ async fn run(config: Config) -> Result<(), String> {
         seen_today,
         rules,
     );
+    core.lookup = lookup.map(|lookup| (lookup, fees_tx));
 
     let mut sigterm = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
     let mut tick = tokio::time::interval(TICK);
     loop {
         tokio::select! {
             Some(event) = events_rx.recv() => core.on_node_event(event),
+            Some((wtxid, fee)) = fees_rx.recv() => core.on_fee(wtxid, fee),
             _ = tick.tick() => core.on_tick(),
             _ = tokio::signal::ctrl_c() => break,
             _ = sigterm.recv() => break,
         }
     }
+    core.finish_pending();
     core.alive("stop");
     info!("stopped");
     Ok(())
 }
+
+/// A tx's wtxid and its lookup's fee.
+type FeeResult = (String, Result<i64, String>);
 
 struct PeerInfo {
     user_agent: String,
@@ -297,6 +374,10 @@ struct Core {
     log: EventLog,
     seen_today: SeenToday,
     rules: Rules,
+    /// The lookup, and where its tasks send each tx's fee.
+    lookup: Option<(Lookup, mpsc::UnboundedSender<FeeResult>)>,
+    /// Fetched txs that wait for a lookup, by wtxid.
+    pending: HashMap<String, (SocketAddr, TxSummary)>,
     last_depth: Instant,
     last_alive: Option<Instant>,
     counts: Counts,
@@ -328,6 +409,8 @@ impl Core {
             log,
             seen_today,
             rules,
+            lookup: None,
+            pending: HashMap::new(),
             last_depth: now,
             last_alive: None,
             counts: Counts::default(),
@@ -577,13 +660,54 @@ impl Core {
         entry.size = Some(tx.raw().len());
         entry.request = None;
 
-        let summary = TxSummary::new(ids.clone(), parsed, tx.raw().len());
-        let mut fields = serde_json::to_value(&summary).expect("a summary serializes");
-        fields["peer"] = json!(addr);
-        self.emit("tx", fields);
         if let Err(e) = self.log.write_raw(t, &ids.wtxid, tx.raw()) {
             error!("can't write raw tx: {e}");
         }
+        let mut summary = TxSummary::new(ids.clone(), parsed, tx.raw().len());
+        let mut fee_error = None;
+        if let (FeeSource::Unknown, Some((lookup, fees))) = (summary.fee_source, &self.lookup) {
+            if let Some(fee) = lookup.cached_fee(parsed) {
+                fee_error = set_fee(&mut summary, fee).err();
+            } else if let Some(slot) = lookup.slot() {
+                let (lookup, fees, parsed) = (lookup.clone(), fees.clone(), parsed.clone());
+                let wtxid = ids.wtxid.clone();
+                tokio::spawn(async move {
+                    let fee = lookup.fee(&parsed).await;
+                    drop(slot);
+                    let _ = fees.send((wtxid, fee));
+                });
+                self.pending.insert(ids.wtxid, (addr, summary));
+                return;
+            } else {
+                fee_error = Some("too many lookups pending".into());
+            }
+        }
+        self.finish_tx(addr, summary, fee_error);
+    }
+
+    fn on_fee(&mut self, wtxid: String, fee: Result<i64, String>) {
+        if let Some((addr, mut summary)) = self.pending.remove(&wtxid) {
+            let fee_error = set_fee(&mut summary, fee).err();
+            self.finish_tx(addr, summary, fee_error);
+        }
+    }
+
+    /// Logs the txs still waiting for a lookup, with an unknown fee.
+    fn finish_pending(&mut self) {
+        for (_, (addr, summary)) in std::mem::take(&mut self.pending) {
+            self.finish_tx(addr, summary, Some("the listener stopped".into()));
+        }
+    }
+
+    /// Logs a fetched tx with its fee, and runs the rules on it.
+    fn finish_tx(&mut self, addr: SocketAddr, summary: TxSummary, fee_error: Option<String>) {
+        let t = Utc::now();
+        let mut fields = serde_json::to_value(&summary).expect("a summary serializes");
+        fields["peer"] = json!(addr);
+        if let Some(e) = fee_error {
+            fields["fee_error"] = json!(e);
+        }
+        self.emit("tx", fields);
         self.counts.fetched += 1;
         metrics::increment_counter!("mempool_txs_fetched_total", "pools" => summary.pools());
         if let Some(fee) = summary.fee {
@@ -806,11 +930,13 @@ mod tests {
         assert_eq!(median_depth(std::iter::empty(), now, fresh), (0, 0));
     }
 
-    #[test]
-    fn replay_800_zat_burst() {
+    #[tokio::test]
+    async fn replay_800_zat_burst() {
         let fixture = include_str!("testdata/burst-800zat.ndjson");
         let lines = fixture.lines().map(|l| Ok(l.to_owned()));
-        let alerts = replay_alerts(&Config::default(), lines).unwrap();
+        let alerts = replay_alerts(&Config::default(), lines, &Replay::default())
+            .await
+            .unwrap();
         let rules: Vec<_> = alerts.iter().map(|(_, a)| a.rule).collect();
         assert_eq!(rules, ["under_floor", "burst"]);
     }

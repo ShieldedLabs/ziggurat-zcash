@@ -18,6 +18,14 @@ gone_after_secs = 600
 reconnect_secs = 120
 max_failures = 1
 
+[lookup]
+# Public lightwalletd servers. The listener asks them for the parent txs of transparent
+# inputs, to get the fee. It caches the parents' output values in data_dir/prevouts.ndjson.
+servers = ["https://zec.rocks:443", "https://na.zec.rocks:443", "https://eu.zec.rocks:443"]
+per_sec = 10.0
+timeout_secs = 120
+max_pending = 20
+
 [rules]
 cooldown_secs = 3600
 

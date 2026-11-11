@@ -300,6 +300,7 @@ mod tests {
             ironwood_actions: 0,
             logical_actions: orchard.max(2) as u32,
             fee,
+            fee_source: Default::default(),
             sapling_value_balance: 0,
             orchard_value_balance: fee.unwrap_or(0),
             ironwood_value_balance: 0,

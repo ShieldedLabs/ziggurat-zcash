@@ -18,6 +18,7 @@ metrics-exporter-prometheus = { version = "0.12", default-features = false, feat
 metrics-util = "0.15"
 parking_lot = "0.12"
 pea2pea = "0.46"
+prost = { version = "0.14", optional = true }
 rand = "0.8"
 rand_chacha = "0.3"
 regex = "1"
@@ -26,6 +27,8 @@ spectre = { git = "https://github.com/niklaslong/spectre", rev = "9a0664f" }
 tabled = "0.10"
 time = "0.3"
 toml = "0.7"
+tonic = { version = "0.14", default-features = false, features = ["channel", "codegen", "tls-ring", "tls-webpki-roots"], optional = true }
+tonic-prost = { version = "0.14", optional = true }
 zebra-chain = "15.0.0"
 ziggurat-core-crawler = { git = "https://github.com/runziggurat/ziggurat-core", rev = "33ef131" }
 ziggurat-core-metrics = { git = "https://github.com/runziggurat/ziggurat-core", rev = "33ef131" }
@@ -81,6 +84,9 @@ mempool = [
     "flate2",
     "serde_json",
     "dep:metrics-exporter-prometheus",
+    "dep:prost",
+    "dep:tonic",
+    "dep:tonic-prost",
 ]
 
 [[bin]]
