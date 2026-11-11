@@ -32,7 +32,7 @@ use ziggurat_zcash::protocol::{
 
 use crate::{
     config::{Config, ListenerConfig},
-    events::{event_line, EventLog, TxIds, TxSummary},
+    events::{event_line, EventLog, SeenToday, TxIds, TxSummary},
     node::{Listener, NodeEvent},
     peers::PeerSet,
     rules::{Alert, Rules, RULES},
@@ -203,7 +203,17 @@ async fn run(config: Config) -> Result<(), String> {
 
     let log = EventLog::open(&listener_config.data_dir).map_err(|e| e.to_string())?;
     let rules = Rules::new(config.rules.clone(), Utc::now());
-    let mut core = Core::new(listener_config, listener, candidates, log, rules);
+    let seen_today =
+        SeenToday::load(&listener_config.data_dir, Utc::now()).map_err(|e| e.to_string())?;
+    info!("{} txs seen earlier today", seen_today.len());
+    let mut core = Core::new(
+        listener_config,
+        listener,
+        candidates,
+        log,
+        seen_today,
+        rules,
+    );
 
     let mut sigterm = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
     let mut tick = tokio::time::interval(TICK);
@@ -258,6 +268,7 @@ struct Core {
     /// Txs marked gone in the last hour, with when and their size if fetched.
     recently_gone: HashMap<String, (Instant, Option<usize>)>,
     log: EventLog,
+    seen_today: SeenToday,
     rules: Rules,
     last_depth: Instant,
     last_alive: Option<Instant>,
@@ -270,6 +281,7 @@ impl Core {
         listener: Listener,
         candidates: Vec<SocketAddr>,
         log: EventLog,
+        seen_today: SeenToday,
         rules: Rules,
     ) -> Self {
         let now = Instant::now();
@@ -287,6 +299,7 @@ impl Core {
             txs: HashMap::new(),
             recently_gone: HashMap::new(),
             log,
+            seen_today,
             rules,
             last_depth: now,
             last_alive: None,
@@ -396,6 +409,7 @@ impl Core {
         let src = if snapshot { "mempool" } else { "inv" };
 
         let mut new = 0;
+        let today = Utc::now();
         let mut fetch = Vec::new();
         for (ids, hash) in hashes {
             let new_for_peer = peer.announced.insert(ids.wtxid.clone());
@@ -418,6 +432,8 @@ impl Core {
                     request: None,
                     tried: HashSet::new(),
                 });
+            // After a restart, the first snapshots list txs the day file already has.
+            let first_today = first && back.is_none() && self.seen_today.first(&ids.wtxid, today);
             entry.last_seen = now;
             if !entry.announcers.contains(&addr) {
                 entry.announcers.push(addr);
@@ -430,13 +446,13 @@ impl Core {
                 ));
             }
             // A snapshot repeats what the peer has, so only gossip and new txs log.
-            if new_for_peer && (!snapshot || (first && back.is_none())) {
+            if new_for_peer && (!snapshot || first_today) {
                 lines.push((
                     "seen",
                     json!({ "txid": ids.txid, "wtxid": ids.wtxid, "peer": addr, "src": src }),
                 ));
             }
-            if first && back.is_none() {
+            if first_today {
                 new += 1;
             }
             if first && entry.size.is_none() {
