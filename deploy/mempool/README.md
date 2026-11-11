@@ -37,6 +37,7 @@ The Grafana alert rules live in `ShieldedLabs/shielded-infra` (`workspaces/metri
 | Large tx | listener | a tx is over 100 KB |
 | Depth, bytes | Grafana | the mempool is over 3x its 24 h median |
 | Few peers, quiet, down | Grafana | under 10 peers, no new tx for 30 min, or no scrape |
+| Peer backlog | Grafana | one peer lists 100+ txs and over 10x the median peer for 10 min |
 
 The listener counts its alerts in `mempool_alerts_total{rule}`, and Grafana alerts on that counter. The txids and shapes are in the `alert` events.
 
@@ -49,6 +50,7 @@ The listener counts its alerts in `mempool_alerts_total{rule}`, and Grafana aler
 | `mempool_txs_fetched_total`, `mempool_txs_undecoded_total` | txs fetched, and those zebra-chain could not parse |
 | `mempool_txs_live` | txs seen in the last 10 min |
 | `mempool_snapshot_median`, `mempool_live_bytes` | median peer mempool count, bytes of fetched live txs |
+| `mempool_peer_snapshot{peer,user_agent}` | each peer's latest mempool count (0 when stale); a dropped peer's series expires after 5 min |
 | `mempool_alerts_total{rule}` | per-tx rule alerts |
 
 ## Events

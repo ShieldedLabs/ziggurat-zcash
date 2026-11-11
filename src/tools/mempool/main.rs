@@ -14,6 +14,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use metrics_exporter_prometheus::Matcher;
+use metrics_util::MetricKindMask;
 use serde_json::{json, Value};
 use tokio::{
     signal::unix::{signal, SignalKind},
@@ -50,6 +51,7 @@ const DEPTH_INTERVAL: Duration = Duration::from_secs(60);
 const ALIVE_INTERVAL: Duration = Duration::from_secs(3600);
 /// A tx that returns this soon after `gone` is the same tx, not a new one.
 const GONE_MEMORY: Duration = Duration::from_secs(3600);
+const GAUGE_IDLE: Duration = Duration::from_secs(300);
 /// 999 is the last bucket under the 1,000 zats per action floor.
 const FEE_PER_ACTION_BUCKETS: [f64; 11] = [
     100.0, 250.0, 500.0, 800.0, 999.0, 1500.0, 2500.0, 5000.0, 10_000.0, 25_000.0, 100_000.0,
@@ -177,6 +179,8 @@ async fn run(config: Config) -> Result<(), String> {
                 &FEE_PER_ACTION_BUCKETS,
             )
             .map_err(|e| format!("metrics buckets: {e}"))?
+            // A dropped peer's gauge expires. Every other gauge is set on each tick.
+            .idle_timeout(MetricKindMask::GAUGE, Some(GAUGE_IDLE))
             .install()
             .map_err(|e| format!("metrics on {addr}: {e}"))?;
         // Start the counters at zero, so Prometheus sees the first event as an increase.
@@ -185,17 +189,6 @@ async fn run(config: Config) -> Result<(), String> {
         }
         metrics::counter!("mempool_txs_seen_total", 0);
         metrics::counter!("mempool_txs_undecoded_total", 0);
-        // The thresholds, so the dashboard draws them from the config.
-        let rules = &config.rules;
-        metrics::gauge!("mempool_under_floor_needed", rules.under_floor.count as f64);
-        metrics::gauge!(
-            "mempool_fee_floor_zats_per_action",
-            rules.under_floor.zats_per_action as f64
-        );
-        metrics::gauge!(
-            "mempool_large_tx_threshold_bytes",
-            rules.large_tx.bytes as f64
-        );
         info!("metrics on http://{addr}/metrics");
     }
 
@@ -615,6 +608,18 @@ impl Core {
         }
 
         metrics::gauge!("mempool_peers_connected", peers as f64);
+        self.export_peer_snapshots(now);
+        // The thresholds, so the dashboard draws them from the config.
+        let rules = self.rules.config();
+        metrics::gauge!("mempool_under_floor_needed", rules.under_floor.count as f64);
+        metrics::gauge!(
+            "mempool_fee_floor_zats_per_action",
+            rules.under_floor.zats_per_action as f64
+        );
+        metrics::gauge!(
+            "mempool_large_tx_threshold_bytes",
+            rules.large_tx.bytes as f64
+        );
         let pressure = self.rules.pressure(Utc::now());
         metrics::gauge!("mempool_burst_top_count", pressure.burst_count as f64);
         // NaN leaves a gap in the dashboard while Burst can't fire yet.
@@ -660,6 +665,24 @@ impl Core {
                     "peers": entry.announcers.len(),
                     "fetched": entry.size.is_some(),
                 }),
+            );
+        }
+    }
+
+    /// Each ready peer's latest mempool count. A stale snapshot counts as empty, because
+    /// Zebra doesn't answer `mempool` when its mempool is empty.
+    fn export_peer_snapshots(&self, now: Instant) {
+        let fresh = Duration::from_secs(self.config.mempool_poll_secs * 2);
+        for (addr, peer) in self.connected.iter().filter(|(_, p)| p.ready_at.is_some()) {
+            let count = peer
+                .snapshot
+                .filter(|(at, _)| now.duration_since(*at) < fresh)
+                .map_or(0, |(_, count)| count);
+            metrics::gauge!(
+                "mempool_peer_snapshot",
+                count as f64,
+                "peer" => addr.to_string(),
+                "user_agent" => peer.user_agent.clone()
             );
         }
     }

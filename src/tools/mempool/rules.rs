@@ -57,6 +57,10 @@ impl Rules {
         }
     }
 
+    pub fn config(&self) -> &RulesConfig {
+        &self.config
+    }
+
     fn windows(&self) -> (chrono::Duration, chrono::Duration) {
         let window = secs(self.config.burst.window_secs);
         (
