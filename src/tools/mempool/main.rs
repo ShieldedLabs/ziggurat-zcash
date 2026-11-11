@@ -48,6 +48,8 @@ const TICK: Duration = Duration::from_secs(5);
 const SNAPSHOT_REPLY: Duration = Duration::from_secs(10);
 const DEPTH_INTERVAL: Duration = Duration::from_secs(60);
 const ALIVE_INTERVAL: Duration = Duration::from_secs(3600);
+/// A tx that returns this soon after `gone` is the same tx, not a new one.
+const GONE_MEMORY: Duration = Duration::from_secs(3600);
 /// 999 is the last bucket under the 1,000 zats per action floor.
 const FEE_PER_ACTION_BUCKETS: [f64; 11] = [
     100.0, 250.0, 500.0, 800.0, 999.0, 1500.0, 2500.0, 5000.0, 10_000.0, 25_000.0, 100_000.0,
@@ -260,6 +262,8 @@ struct Core {
     peers: PeerSet,
     connected: HashMap<SocketAddr, PeerInfo>,
     txs: HashMap<String, TxEntry>,
+    /// Txs marked gone in the last hour, with when and their size if fetched.
+    recently_gone: HashMap<String, (Instant, Option<usize>)>,
     log: EventLog,
     rules: Rules,
     last_depth: Instant,
@@ -288,6 +292,7 @@ impl Core {
             peers,
             connected: HashMap::new(),
             txs: HashMap::new(),
+            recently_gone: HashMap::new(),
             log,
             rules,
             last_depth: now,
@@ -397,10 +402,16 @@ impl Core {
         }
         let src = if snapshot { "mempool" } else { "inv" };
 
+        let mut new = 0;
         let mut fetch = Vec::new();
         for (ids, hash) in hashes {
             let new_for_peer = peer.announced.insert(ids.wtxid.clone());
             let first = !self.txs.contains_key(&ids.wtxid);
+            let back = if first {
+                self.recently_gone.remove(&ids.wtxid)
+            } else {
+                None
+            };
             let entry = self
                 .txs
                 .entry(ids.wtxid.clone())
@@ -410,7 +421,7 @@ impl Core {
                     first_seen: now,
                     last_seen: now,
                     announcers: Vec::new(),
-                    size: None,
+                    size: back.and_then(|(_, size)| size),
                     request: None,
                     tried: HashSet::new(),
                 });
@@ -418,14 +429,24 @@ impl Core {
             if !entry.announcers.contains(&addr) {
                 entry.announcers.push(addr);
             }
-            // A snapshot repeats what the peer has, so only gossip and first sightings log.
-            if new_for_peer && (!snapshot || first) {
+            if let Some((gone_at, _)) = back {
+                let after = now.duration_since(gone_at).as_secs();
+                lines.push((
+                    "back",
+                    json!({ "txid": ids.txid, "wtxid": ids.wtxid, "peer": addr, "after_secs": after }),
+                ));
+            }
+            // A snapshot repeats what the peer has, so only gossip and new txs log.
+            if new_for_peer && (!snapshot || (first && back.is_none())) {
                 lines.push((
                     "seen",
                     json!({ "txid": ids.txid, "wtxid": ids.wtxid, "peer": addr, "src": src }),
                 ));
             }
-            if first {
+            if first && back.is_none() {
+                new += 1;
+            }
+            if first && entry.size.is_none() {
                 fetch.push(ids.wtxid);
             }
         }
@@ -433,8 +454,8 @@ impl Core {
         for (event, fields) in lines {
             self.emit(event, fields);
         }
-        self.counts.seen += fetch.len() as u64;
-        metrics::counter!("mempool_txs_seen_total", fetch.len() as u64);
+        self.counts.seen += new;
+        metrics::counter!("mempool_txs_seen_total", new);
         for wtxid in fetch {
             self.request(&wtxid, addr, now);
         }
@@ -622,8 +643,11 @@ impl Core {
             .filter(|(_, e)| now.duration_since(e.last_seen) >= gone_after)
             .map(|(wtxid, _)| wtxid.clone())
             .collect();
+        self.recently_gone
+            .retain(|_, (at, _)| now.duration_since(*at) < GONE_MEMORY);
         for wtxid in gone {
             let entry = self.txs.remove(&wtxid).expect("listed above");
+            self.recently_gone.insert(wtxid.clone(), (now, entry.size));
             for peer in self.connected.values_mut() {
                 peer.announced.remove(&wtxid);
             }

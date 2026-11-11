@@ -63,6 +63,7 @@ One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `ev
 | `tx` | a fetched tx: counts, ZIP 317 actions, fee (null with transparent inputs) |
 | `tx_undecoded` | zebra-chain could not parse a tx; the raw file keeps its bytes |
 | `gone` | no peer listed the tx for 10 min (mined or evicted) |
+| `back` | a tx marked gone returned within an hour (rebroadcast, or a node re-added it); it isn't counted or fetched again |
 | `alert` | a per-tx rule fired |
 | `alive`, `stop` | hourly counts, and the counts at shutdown |
 
