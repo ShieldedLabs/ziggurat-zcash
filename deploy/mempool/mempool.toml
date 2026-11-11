@@ -25,6 +25,7 @@ cooldown_secs = 3600
 count = 5
 window_secs = 600
 factor = 3.0
+max_chance = 0.0001
 baseline_secs = 3600
 size_bucket_bytes = 1000
 

@@ -87,6 +87,8 @@ pub struct BurstConfig {
     pub window_secs: u64,
     /// Fire only above this many times the shape's usual count per window.
     pub factor: f64,
+    /// Fire only on a count this unlikely at the usual rate (Poisson tail).
+    pub max_chance: f64,
     /// The usual count comes from this span before the window. No burst fires until the
     /// listener has run this long.
     pub baseline_secs: u64,
@@ -100,6 +102,7 @@ impl Default for BurstConfig {
             count: 5,
             window_secs: 600,
             factor: 3.0,
+            max_chance: 1e-4,
             baseline_secs: 3600,
             size_bucket_bytes: 1000,
         }

@@ -32,7 +32,7 @@ The Grafana alert rules live in `ShieldedLabs/shielded-infra` (`workspaces/metri
 
 | Alert | Where it runs | Fires when |
 |---|---|---|
-| Burst | listener | 5+ txs of one shape in 10 min, over 3x the shape's usual rate |
+| Burst | listener | 5+ txs of one shape in 10 min, over 3x the shape's usual rate, and under a 1 in 10,000 chance at that rate |
 | Under floor | listener | 3+ txs in 10 min pay under 1,000 zats per ZIP 317 action |
 | Large tx | listener | a tx is over 100 KB |
 | Depth, bytes | Grafana | the mempool is over 3x its 24 h median |

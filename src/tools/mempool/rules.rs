@@ -77,10 +77,13 @@ impl Rules {
         (count, usual)
     }
 
-    /// The fewest txs in the window that fire Burst for a shape with this usual count.
+    /// The fewest txs in the window that fire Burst for a shape with this usual count:
+    /// at least `count`, over `factor` times the usual count, and unlikely by chance.
     fn burst_needed(&self, usual: f64) -> usize {
-        let above_usual = (self.config.burst.factor * usual).floor() as usize + 1;
-        self.config.burst.count.max(above_usual)
+        let burst = &self.config.burst;
+        let above_usual = (burst.factor * usual).floor() as usize + 1;
+        let unlikely = poisson_unlikely(usual, burst.max_chance);
+        burst.count.max(above_usual).max(unlikely)
     }
 
     pub fn pressure(&self, t: DateTime<Utc>) -> Pressure {
@@ -250,6 +253,22 @@ pub fn shape_label(tx: &TxSummary, bucket_bytes: usize) -> String {
     parts.join(", ")
 }
 
+/// The smallest n with P(X >= n) < `chance`, for X Poisson with mean `mean`.
+fn poisson_unlikely(mean: f64, chance: f64) -> usize {
+    // Sum the pmf in log space, so a large mean doesn't underflow e^-mean.
+    let mut log_pmf = -mean;
+    let mut cdf = 0.0;
+    let mut n = 0;
+    loop {
+        if 1.0 - cdf < chance {
+            return n;
+        }
+        cdf += log_pmf.exp();
+        n += 1;
+        log_pmf += (mean / n as f64).ln();
+    }
+}
+
 fn secs(n: u64) -> chrono::Duration {
     chrono::Duration::seconds(n as i64)
 }
@@ -331,6 +350,19 @@ mod tests {
         assert_eq!(p.under_floor_count, 2);
         assert_eq!(p.largest_tx, 120_000);
         assert_eq!(rules.pressure(at(5_000)).under_floor_count, 0);
+    }
+
+    #[test]
+    fn burst_needs_an_unlikely_count() {
+        let rules = rules();
+        // A new shape fires at the minimum count.
+        assert_eq!(rules.burst_needed(0.0), 5);
+        // 6 txs at a usual 1.8 is a 1% chance. 10 is under 1 in 10,000.
+        assert_eq!(rules.burst_needed(1.8), 10);
+        // A busy shape keeps the 3x rule.
+        assert_eq!(rules.burst_needed(17.0), 52);
+        // A flood-sized mean stays finite: about 3.7 standard deviations up.
+        assert!((2160..2175).contains(&poisson_unlikely(2000.0, 1e-4)));
     }
 
     #[test]
