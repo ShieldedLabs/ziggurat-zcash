@@ -177,10 +177,12 @@ async fn run(config: Config) -> Result<(), String> {
             .map_err(|e| format!("metrics buckets: {e}"))?
             .install()
             .map_err(|e| format!("metrics on {addr}: {e}"))?;
-        // Start each alert counter at zero, so Prometheus sees the first alert as an increase.
+        // Start the counters at zero, so Prometheus sees the first event as an increase.
         for rule in RULES {
             metrics::counter!("mempool_alerts_total", 0, "rule" => rule);
         }
+        metrics::counter!("mempool_txs_seen_total", 0);
+        metrics::counter!("mempool_txs_undecoded_total", 0);
         // The thresholds, so the dashboard draws them from the config.
         let rules = &config.rules;
         metrics::gauge!("mempool_under_floor_needed", rules.under_floor.count as f64);
@@ -594,7 +596,9 @@ impl Core {
         metrics::gauge!("mempool_peers_connected", peers as f64);
         let pressure = self.rules.pressure(Utc::now());
         metrics::gauge!("mempool_burst_top_count", pressure.burst_count as f64);
-        metrics::gauge!("mempool_burst_top_needed", pressure.burst_needed as f64);
+        // NaN leaves a gap in the dashboard while Burst can't fire yet.
+        let needed = pressure.burst_needed.map_or(f64::NAN, |n| n as f64);
+        metrics::gauge!("mempool_burst_top_needed", needed);
         metrics::gauge!(
             "mempool_under_floor_count",
             pressure.under_floor_count as f64

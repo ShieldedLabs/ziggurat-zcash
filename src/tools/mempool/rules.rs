@@ -24,8 +24,9 @@ pub const RULES: [&str; 3] = ["burst", "under_floor", "large_tx"];
 #[derive(Debug, Default, PartialEq)]
 pub struct Pressure {
     /// The busiest shape (by count over what fires) in the burst window, and what fires it.
+    /// `None` during the first baseline after a start, when Burst can't fire.
     pub burst_count: usize,
-    pub burst_needed: usize,
+    pub burst_needed: Option<usize>,
     pub under_floor_count: usize,
     /// The largest tx in the burst window.
     pub largest_tx: usize,
@@ -83,7 +84,7 @@ impl Rules {
     }
 
     pub fn pressure(&self, t: DateTime<Utc>) -> Pressure {
-        let (window, _) = self.windows();
+        let (window, baseline) = self.windows();
         let (burst_count, burst_needed) = self
             .burst
             .values()
@@ -96,7 +97,7 @@ impl Rules {
         let floor_window = secs(self.config.under_floor.window_secs);
         Pressure {
             burst_count,
-            burst_needed,
+            burst_needed: (t - self.started >= baseline).then_some(burst_needed),
             under_floor_count: self
                 .under_floor
                 .iter()
@@ -318,13 +319,7 @@ mod tests {
     #[test]
     fn pressure_tracks_each_rule() {
         let mut rules = rules();
-        assert_eq!(
-            rules.pressure(at(0)),
-            Pressure {
-                burst_needed: 5,
-                ..Default::default()
-            }
-        );
+        assert_eq!(rules.pressure(at(0)), Pressure::default());
         // An hour of 6 txs per 10 min sets the shape's usual count.
         for i in 0..36 {
             rules.on_tx(at(i * 100), &tx(100 + i as usize, 4_200, 0, None));
@@ -332,7 +327,7 @@ mod tests {
         rules.on_tx(at(3_600), &tx(1, 9_150, 2, Some(800)));
         rules.on_tx(at(3_610), &tx(2, 120_000, 2, Some(800)));
         let p = rules.pressure(at(3_620));
-        assert_eq!((p.burst_count, p.burst_needed), (5, 19));
+        assert_eq!((p.burst_count, p.burst_needed), (5, Some(19)));
         assert_eq!(p.under_floor_count, 2);
         assert_eq!(p.largest_tx, 120_000);
         assert_eq!(rules.pressure(at(5_000)).under_floor_count, 0);
