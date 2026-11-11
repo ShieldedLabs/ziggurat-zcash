@@ -35,7 +35,7 @@ The Grafana alert rules live in `ShieldedLabs/shielded-infra` (`workspaces/metri
 | Burst | listener | 5+ txs of one shape in 10 min, over 3x the shape's usual rate, and under a 1 in 10,000 chance at that rate |
 | Under floor | listener | 3+ txs in 10 min pay under 1,000 zats per ZIP 317 action |
 | Large tx | listener | a tx is over 100 KB |
-| Depth, bytes | Grafana | the mempool is over 3x its 24 h median |
+| Depth, bytes | Grafana | the median peer's mempool is over 3x its 24 h median |
 | Few peers, quiet, down | Grafana | under 10 peers, no new tx for 30 min, or no scrape |
 | Peer backlog | Grafana | one peer lists 100+ txs and over 10x the median peer for 10 min |
 
@@ -49,7 +49,8 @@ The listener counts its alerts in `mempool_alerts_total{rule}`, and Grafana aler
 | `mempool_txs_seen_total` | txs seen for the first time today (UTC). At start the listener reads today's `seen` events, so a restart counts no tx twice |
 | `mempool_txs_fetched_total`, `mempool_txs_undecoded_total` | txs fetched, and those zebra-chain could not parse |
 | `mempool_txs_live` | txs seen in the last 10 min |
-| `mempool_snapshot_median`, `mempool_live_bytes` | median peer mempool count, bytes of fetched live txs |
+| `mempool_snapshot_median`, `mempool_snapshot_median_bytes` | the median peer's mempool count and bytes. Each is a median over fresh snapshots, so one peer's backlog moves neither |
+| `mempool_live_bytes` | bytes of all fetched live txs, from every peer |
 | `mempool_peer_snapshot{peer,user_agent}` | each peer's latest mempool count (0 when stale); a dropped peer's series expires after 5 min |
 | `mempool_alerts_total{rule}` | per-tx rule alerts |
 
@@ -61,7 +62,7 @@ One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `ev
 |---|---|
 | `peer_up`, `peer_down` | a peer finished its handshake, or dropped |
 | `seen` | a peer announced a tx by gossip, or a snapshot showed a tx new today |
-| `snapshot` | a peer answered `mempool` with `count` ids |
+| `snapshot` | a peer answered `mempool` with `count` ids, `bytes` of them fetched |
 | `tx` | a fetched tx: counts, ZIP 317 actions, fee (null with transparent inputs) |
 | `tx_undecoded` | zebra-chain could not parse a tx; the raw file keeps its bytes |
 | `gone` | no peer listed the tx for 10 min (mined or evicted) |
