@@ -1,4 +1,4 @@
-# mempool-listener config for the VPS. The rules sections hold the defaults.
+# mempool-listener config for the metrics VPS. The rules sections hold the defaults.
 # Tune the rule thresholds after a week of data. Grafana alerts on depth, peers
 # and liveness from the metrics, and on the mempool_alerts_total{rule} counter.
 
@@ -10,7 +10,7 @@ census_dir = "/data/census"
 target_peers = 50
 data_dir = "/data/mempool"
 user_agent = "/zero-mempool:0.1.0/"
-# Prometheus scrapes this over the VPC. Compose publishes it on the VPC address only.
+# Prometheus scrapes mempool-listener:9101 on metrics-net. No port is published.
 metrics_addr = "0.0.0.0:9101"
 mempool_poll_secs = 60
 getdata_timeout_secs = 30

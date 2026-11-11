@@ -55,7 +55,7 @@ struct Args {
     #[clap(long, value_parser, default_value = "mempool.toml")]
     config: PathBuf,
 
-    /// Feed the tx events of an NDJSON file through the rules, print the alerts, and exit
+    /// Feed the tx events of an NDJSON file (or .ndjson.gz) through the rules, print the alerts, and exit
     #[clap(long, value_parser)]
     replay: Option<PathBuf>,
 }
@@ -104,7 +104,13 @@ fn start_logger() {
 }
 
 fn replay(config: &Config, path: &Path) -> io::Result<()> {
-    let lines = BufReader::new(File::open(path)?).lines();
+    let file = File::open(path)?;
+    let reader: Box<dyn BufRead> = if path.extension().is_some_and(|e| e == "gz") {
+        Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+    let lines = reader.lines();
     for (t, alert) in replay_alerts(config, lines)? {
         print!("{}", event_line(t, "alert", serde_json::to_value(&alert)?));
     }

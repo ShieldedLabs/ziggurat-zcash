@@ -1,8 +1,9 @@
-# Runs the mempool listener. Fill .env from .env.example first.
-# Grafana on the metrics VPS scrapes :9101 over the VPC and sends the alerts.
+# Runs the mempool listener on the metrics VPS. Fill .env from .env.example first.
+# Prometheus scrapes mempool-listener:9101 on metrics-net. Grafana sends the alerts.
 
 services:
   listener:
+    container_name: mempool-listener
     build:
       context: .
       args:
@@ -13,7 +14,12 @@ services:
     volumes:
       - ./mempool.toml:/etc/mempool/mempool.toml:ro
       - ./data:/data
-    ports:
-      # Prometheus, on the VPC address only.
-      - "${VPC_IP}:9101:9101"
+    # A tx flood grows the listener. The cap keeps Grafana and Prometheus safe.
+    mem_limit: 512m
+    networks:
+      - metrics-net
     restart: unless-stopped
+
+networks:
+  metrics-net:
+    external: true

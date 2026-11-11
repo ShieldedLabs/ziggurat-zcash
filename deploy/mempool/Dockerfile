@@ -1,5 +1,5 @@
 # Fetches the release binary. zebra-chain builds too slowly on a small VPS.
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 ARG RELEASE_URL
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \

@@ -1,13 +1,13 @@
 # Mempool listener deployment
 
-The listener connects to about 50 Zebra and Zakura peers, logs mempool gossip, and exports Prometheus metrics. Grafana on the metrics VPS alerts on them.
+The listener runs on the metrics VPS (`metrics.shieldedinfra.net`). It connects to about 50 Zebra and Zakura peers, logs mempool gossip, and exports Prometheus metrics. Grafana on the same host alerts on them.
 
 ```mermaid
 flowchart LR
   P["Zebra/Zakura peers"] -->|inv, tx| L[listener]
   L -->|getdata, mempool| P
   L --> D["data/mempool/*.ndjson(.gz)"]
-  M["Prometheus + Grafana<br/>(metrics VPS)"] -->|":9101/metrics over the VPC"| L
+  M["Prometheus + Grafana<br/>(same host)"] -->|"mempool-listener:9101 on metrics-net"| L
   M -->|alerts| Phone
 ```
 
@@ -15,18 +15,18 @@ flowchart LR
 
 | File | Use |
 |---|---|
-| `compose.yml` | the listener service |
+| `compose.yml` | the listener service, on `metrics-net`, capped at 512 MB |
 | `Dockerfile` | fetches the release binary |
 | `mempool.toml` | listener config and per-tx rule thresholds |
 
-The Grafana alert rules and the Prometheus scrape job live in `ShieldedLabs/shielded-infra` (`workspaces/mempool/README.md`).
+The Grafana alert rules live in `ShieldedLabs/shielded-infra` (`workspaces/metrics/grafana/alerting/mempool.yaml`). Its `workspaces/metrics/README.md` lists the host steps.
 
 ## Set up
 
-1. Copy `.env.example` to `.env`. Set `RELEASE_URL` and `VPC_IP`.
+1. Copy this directory to `/root/mempool` on the metrics VPS, and `.env.example` to `.env`.
 2. Copy a recent `census-*.ndjson.gz` from the crawler into `data/census/`.
-3. Start the listener: `docker compose up -d`.
-4. Check the metrics from the metrics VPS: `curl http://<VPC_IP>:9101/metrics`.
+3. Start the listener: `docker compose up -d --build`.
+4. Check the metrics: `docker run --rm --network metrics-net curlimages/curl -s http://mempool-listener:9101/metrics`.
 
 ## Alerts
 
@@ -53,7 +53,7 @@ The listener counts its alerts in `mempool_alerts_total{rule}`, and Grafana aler
 
 ## Events
 
-One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `event`:
+One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `event`. At each UTC day change the listener gzips the past days' files to `.ndjson.gz`. Expect about 50 MB a day in all.
 
 | Event | Meaning |
 |---|---|
@@ -68,4 +68,4 @@ One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `ev
 
 `raw-YYYYMMDD.ndjson.gz` holds `{"wtxid","hex"}` per fetched tx. Each line is its own gzip member, so `gzcat` reads it after a crash.
 
-Replay a day through the per-tx rules: `mempool-listener --config mempool.toml --replay mempool-YYYYMMDD.ndjson`.
+Replay a day through the per-tx rules: `mempool-listener --config mempool.toml --replay mempool-YYYYMMDD.ndjson.gz`.

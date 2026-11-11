@@ -10,6 +10,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use flate2::{write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use tracing::warn;
 use zebra_chain::transaction::{zip317, Transaction};
 use ziggurat_zcash::protocol::payload::{inv::InvHash, Hash};
 
@@ -170,8 +171,36 @@ impl EventLog {
         self.events = Some(open(format!("mempool-{stamp}.ndjson"))?);
         self.raw = Some(open(format!("raw-{stamp}.ndjson.gz"))?);
         self.day = Some(day);
+
+        let dir = self.dir.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = compress_past_events(&dir, day) {
+                warn!("can't compress past event files: {e}");
+            }
+        });
         Ok(())
     }
+}
+
+/// Gzips every `mempool-YYYYMMDD.ndjson` before `today` into `.ndjson.gz` and removes it.
+pub fn compress_past_events(dir: &Path, today: NaiveDate) -> io::Result<()> {
+    let current = format!("mempool-{}.ndjson", today.format("%Y%m%d"));
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("mempool-") || !name.ends_with(".ndjson") || name == current {
+            continue;
+        }
+        let gz_path = dir.join(format!("{name}.gz"));
+        let gz_file = OpenOptions::new().create(true).append(true).open(gz_path)?;
+        let mut gz = GzEncoder::new(gz_file, Compression::default());
+        io::copy(&mut File::open(&path)?, &mut gz)?;
+        gz.finish()?;
+        fs::remove_file(&path)?;
+    }
+    Ok(())
 }
 
 /// `{"t":<unix secs>,"event":<name>,...fields}` plus a newline.
@@ -222,6 +251,30 @@ mod tests {
             line,
             "{\"t\":1700000000,\"event\":\"seen\",\"peer\":\"1.2.3.4:8233\"}\n"
         );
+    }
+
+    #[test]
+    fn past_event_files_get_gzipped() {
+        let dir = std::env::temp_dir().join(format!("mempool-gzip-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("mempool-20261110.ndjson"),
+            "{\"event\":\"alive\"}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("mempool-20261111.ndjson"), "today\n").unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 11).unwrap();
+        compress_past_events(&dir, today).unwrap();
+
+        assert!(!dir.join("mempool-20261110.ndjson").exists());
+        assert!(dir.join("mempool-20261111.ndjson").exists());
+        let gz = File::open(dir.join("mempool-20261110.ndjson.gz")).unwrap();
+        let lines: Vec<String> = BufReader::new(MultiGzDecoder::new(gz))
+            .lines()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(lines, ["{\"event\":\"alive\"}"]);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
