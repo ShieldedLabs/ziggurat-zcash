@@ -171,12 +171,13 @@ A soak on 2026-11-11 ran this build against the 50 census peers for 2 hours, at 
 | Hour 19:00 UTC | Raw NDJSON | Compressed |
 |---|---|---|
 | All 60 min | 93 MB | 28.0 MB |
-| 57 steady min, without 3 reconnect spikes | 28 MB | 3.4 MB |
+| 57 quiet min, without 3 sweep batches | 28 MB | 3.4 MB |
 
-- Steady state: about 3.6 MB an hour, so about 90 MB a day and about 32 GB for a year.
-- `tx` bodies are most of the bytes. The private backlog peer's 1,600-id `mempool` reply each minute compresses well, because zstd finds the last minute's copy.
-- Each spike was the backlog peer reconnecting, and the listener fetching its 1,600 txs again (about 8 MB compressed each). The soak host's network dropped connections every few minutes. The VPS keeps its peers, so its rate should stay near the steady figure. At one spike every 7 minutes, a day would reach about 670 MB, and a year about 245 GB.
-- Disk on the VPS holds 14 days, about 1.3 GB.
+- `tx` bodies are most of the bytes. The private backlog peer's `mempool` reply each minute compresses well, because zstd finds the last minute's copy.
+- From 19:43 UTC the backlog peer listed a new batch every 6 to 7 minutes: about 1,350 new 50-input sweeps (7 KB each), with no input shared between batches. Each batch is about 8 MB compressed. The VPS saw the same batches.
+- Quiet mempool: about 3.6 MB an hour, so about 90 MB a day and about 32 GB a year.
+- While the sweep batches run: about 28 MB an hour, so about 670 MB a day and about 245 GB a year.
+- Disk on the VPS holds 14 days: about 1.3 GB quiet, about 9 GB during the sweep.
 
 ### Upload
 
