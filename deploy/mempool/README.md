@@ -84,6 +84,8 @@ One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `ev
 
 The listener asks the `[lookup] servers` in `mempool.toml` (public lightwalletd, gRPC `GetTransaction`) for each parent tx. It parses the reply with zebra-chain and checks the txid. Calls go at most `per_sec` per second over all servers. It caches each parent's output values in `data/mempool/prevouts.ndjson`, so a parent costs one call. At most `max_pending` txs wait for lookups at once, and each waits at most `timeout_secs`. An empty server list turns lookups off.
 
+The lookup prices a sample during a flood. A 50-input tx needs up to 50 calls. From 22:00 to 23:00 UTC on 2026-11-11, 6,067 sweeps arrived. The lookup made about 10,900 calls with no errors and priced 418 txs. The other 5,847 logged `fee_error: too many lookups pending`. Under floor still fired, but counts and fee charts cover the priced txs only.
+
 `raw-YYYYMMDD.ndjson.gz` holds `{"wtxid","hex"}` per fetched tx. Each line is its own gzip member, so `gzcat` reads it after a crash.
 
 Replay a day through the per-tx rules: `mempool-listener --config mempool.toml --replay mempool-YYYYMMDD.ndjson.gz`. Add `--raw raw-YYYYMMDD.ndjson.gz` to look up the unknown fees first.
@@ -166,18 +168,18 @@ So the difference between two peers' `t` measures the gap between their announce
 
 ### Size
 
-A soak on 2026-11-11 ran this build against the 50 census peers for 2 hours, at zstd level 9 with a 16 MiB window.
+The VPS measured these on 2026-11-11, with zstd level 9 and a 16 MiB window:
 
-| Hour 19:00 UTC | Raw NDJSON | Compressed |
-|---|---|---|
-| All 60 min | 93 MB | 28.0 MB |
-| 57 quiet min, without 3 sweep batches | 28 MB | 3.4 MB |
+| UTC hour | Compressed | Txs fetched | Note |
+|---|---|---|---|
+| 21:00 | 216 MB | | v0.1.10 started at 21:49 and fetched about 30,000 backlog txs |
+| 22:00 | 61 MB | 6,319 | 6,067 of them 50-input sweeps |
 
-- `tx` bodies are most of the bytes. The private backlog peer's `mempool` reply each minute compresses well, because zstd finds the last minute's copy.
-- From 19:43 UTC the backlog peer listed a new batch every 6 to 7 minutes: about 1,350 new 50-input sweeps (7 KB each), with no input shared between batches. Each batch is about 8 MB compressed. The VPS saw the same batches.
-- Quiet mempool: about 3.6 MB an hour, so about 90 MB a day and about 32 GB a year.
-- While the sweep batches run: about 28 MB an hour, so about 670 MB a day and about 245 GB a year.
-- Disk on the VPS holds 14 days: about 1.3 GB quiet, about 9 GB during the sweep.
+- `tx` bodies are most of the bytes. Each `mempool` reply repeats the last minute's, and zstd compresses the repeat well.
+- While the sweep runs: about 61 MB an hour, so about 1.5 GB a day and about 540 GB a year.
+- A quiet mempool: a soak on a Mac measured about 3.6 MB an hour (about 90 MB a day, 32 GB a year).
+- Each restart fetches every tx the peers list again, about 150 MB during the sweep.
+- Disk on the VPS holds 14 days: about 20 GB during the sweep.
 
 ### Upload
 
