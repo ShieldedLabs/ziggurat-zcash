@@ -210,7 +210,11 @@ async fn get_latest_block(channel: Channel) -> Result<u32, String> {
         )
         .await
         .map_err(|e| e.message().to_owned())?;
-    u32::try_from(response.into_inner().height).map_err(|e| e.to_string())
+    tip_height(response.into_inner())
+}
+
+fn tip_height(block: BlockId) -> Result<u32, String> {
+    u32::try_from(block.height).map_err(|e| e.to_string())
 }
 
 async fn get_transaction(channel: Channel, txid: transaction::Hash) -> Result<Vec<i64>, String> {
@@ -339,6 +343,47 @@ mod tests {
         let first = tx.spent_outpoints().next().unwrap();
         values.remove(&first.hash);
         assert!(fee(&tx, &values).is_err());
+    }
+
+    #[test]
+    fn tip_from_lightwalletd_bytes() {
+        // zec.rocks' GetLatestBlock reply on 2026-11-12, encoded from lightwalletd's
+        // service.proto: BlockID { uint64 height = 1; bytes hash = 2; }.
+        let bytes = hex::decode(
+            "08f7dcd9011220d814b63fe9402df62d63b0963c0552e6ccd85014da1486434e39550100000000",
+        )
+        .unwrap();
+        let block = <BlockId as prost::Message>::decode(&bytes[..]).unwrap();
+        assert_eq!(tip_height(block), Ok(3_567_223));
+        assert!(tip_height(BlockId { height: 1 << 32 }).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_failed_server_passes_to_the_next() {
+        let dir = std::env::temp_dir().join(format!("mempool-turns-{}", std::process::id()));
+        let config = LookupConfig {
+            servers: vec!["http://127.0.0.1:1".into(), "http://127.0.0.1:2".into()],
+            per_sec: 1000.0,
+            ..Default::default()
+        };
+        let lookup = Lookup::new(&config, &dir.join("prevouts.ndjson"))
+            .unwrap()
+            .unwrap();
+        let calls = AtomicUsize::new(0);
+        let answer = lookup
+            .first_answer(|_| async {
+                match calls.fetch_add(1, Ordering::Relaxed) {
+                    0 => Err("down".to_owned()),
+                    _ => Ok(7),
+                }
+            })
+            .await;
+        assert_eq!(answer, Ok(7));
+        let errors = lookup
+            .first_answer(|_| async { Err::<u32, _>("down".to_owned()) })
+            .await;
+        assert_eq!(errors, Err("down; down".to_owned()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
