@@ -21,6 +21,7 @@ max_failures = 1
 [lookup]
 # Public lightwalletd servers. The listener asks them for the parent txs of transparent
 # inputs, to get the fee. It caches the parents' output values in data_dir/prevouts.ndjson.
+# It also polls them for the chain tip every 30 s, for `gone` events.
 servers = ["https://zec.rocks:443", "https://na.zec.rocks:443", "https://eu.zec.rocks:443"]
 per_sec = 10.0
 timeout_secs = 120

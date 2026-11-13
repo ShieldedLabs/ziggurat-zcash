@@ -67,7 +67,7 @@ One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `ev
 | `snapshot` | a peer answered `mempool` with `count` ids, `bytes` of them fetched |
 | `tx` | a fetched tx: counts, ZIP 317 actions, `fee` and `fee_source`. A tx with transparent inputs logs after its lookup |
 | `tx_undecoded` | zebra-chain could not parse a tx; the raw file keeps its bytes |
-| `gone` | no peer listed the tx for 10 min (mined or evicted) |
+| `gone` | no peer listed the tx for 10 min (mined, expired or evicted). `tip_height` is the chain tip then, from the lookup servers; a tx whose `expiry_height` is at or below it expired |
 | `back` | a tx marked gone returned within an hour (rebroadcast, or a node re-added it); it isn't counted or fetched again |
 | `alert` | a per-tx rule fired |
 | `alive`, `stop` | hourly counts, and the counts at shutdown |

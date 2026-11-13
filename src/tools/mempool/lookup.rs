@@ -1,9 +1,11 @@
 //! Fees for txs with transparent inputs. The listener asks lightwalletd for each spent
 //! output's parent tx, parses it with zebra-chain, and caches its output values on disk.
+//! The same servers give the chain tip, so `gone` events can say whether a tx expired.
 
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
+    future::Future,
     io::{self, BufRead, BufReader, Write},
     path::Path,
     sync::{
@@ -33,6 +35,7 @@ use zebra_chain::{
 use crate::config::LookupConfig;
 
 const GET_TRANSACTION: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTransaction";
+const GET_LATEST_BLOCK: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock";
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 // The lightwalletd messages this module uses, from `service.proto`.
@@ -48,6 +51,15 @@ struct RawTransaction {
     #[prost(bytes = "vec", tag = "1")]
     data: Vec<u8>,
     #[prost(uint64, tag = "2")]
+    height: u64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ChainSpec {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct BlockId {
+    #[prost(uint64, tag = "1")]
     height: u64,
 }
 
@@ -151,24 +163,58 @@ impl Lookup {
         Ok(())
     }
 
-    /// Asks each server in turn until one returns the tx.
+    /// The chain tip height.
+    pub async fn tip(&self) -> Result<u32, String> {
+        self.first_answer(get_latest_block).await
+    }
+
     async fn fetch(&self, txid: transaction::Hash) -> Result<Vec<i64>, String> {
-        let mut errors = Vec::new();
-        for _ in 0..self.servers.len() {
-            self.limiter.lock().await.tick().await;
-            let i = self.next.fetch_add(1, Ordering::Relaxed) % self.servers.len();
-            let result = get_transaction(self.servers[i].clone(), txid).await;
+        self.first_answer(|channel| async move {
+            let result = get_transaction(channel, txid).await;
             metrics::increment_counter!(
                 "mempool_fee_lookups_total",
                 "result" => if result.is_ok() { "ok" } else { "error" }
             );
-            match result {
-                Ok(values) => return Ok(values),
+            result
+        })
+        .await
+        .map_err(|e| format!("{txid}: {e}"))
+    }
+
+    /// Asks each server in turn until one answers.
+    async fn first_answer<T, F>(&self, call: impl Fn(Channel) -> F) -> Result<T, String>
+    where
+        F: Future<Output = Result<T, String>>,
+    {
+        let mut errors = Vec::new();
+        for _ in 0..self.servers.len() {
+            self.limiter.lock().await.tick().await;
+            let i = self.next.fetch_add(1, Ordering::Relaxed) % self.servers.len();
+            match call(self.servers[i].clone()).await {
+                Ok(answer) => return Ok(answer),
                 Err(e) => errors.push(e),
             }
         }
-        Err(format!("{txid}: {}", errors.join("; ")))
+        Err(errors.join("; "))
     }
+}
+
+async fn get_latest_block(channel: Channel) -> Result<u32, String> {
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.map_err(|e| e.to_string())?;
+    let response: tonic::Response<BlockId> = grpc
+        .unary(
+            tonic::Request::new(ChainSpec {}),
+            PathAndQuery::from_static(GET_LATEST_BLOCK),
+            tonic_prost::ProstCodec::default(),
+        )
+        .await
+        .map_err(|e| e.message().to_owned())?;
+    tip_height(response.into_inner())
+}
+
+fn tip_height(block: BlockId) -> Result<u32, String> {
+    u32::try_from(block.height).map_err(|e| e.to_string())
 }
 
 async fn get_transaction(channel: Channel, txid: transaction::Hash) -> Result<Vec<i64>, String> {
@@ -297,6 +343,47 @@ mod tests {
         let first = tx.spent_outpoints().next().unwrap();
         values.remove(&first.hash);
         assert!(fee(&tx, &values).is_err());
+    }
+
+    #[test]
+    fn tip_from_lightwalletd_bytes() {
+        // zec.rocks' GetLatestBlock reply on 2026-11-12, encoded from lightwalletd's
+        // service.proto: BlockID { uint64 height = 1; bytes hash = 2; }.
+        let bytes = hex::decode(
+            "08f7dcd9011220d814b63fe9402df62d63b0963c0552e6ccd85014da1486434e39550100000000",
+        )
+        .unwrap();
+        let block = <BlockId as prost::Message>::decode(&bytes[..]).unwrap();
+        assert_eq!(tip_height(block), Ok(3_567_223));
+        assert!(tip_height(BlockId { height: 1 << 32 }).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_failed_server_passes_to_the_next() {
+        let dir = std::env::temp_dir().join(format!("mempool-turns-{}", std::process::id()));
+        let config = LookupConfig {
+            servers: vec!["http://127.0.0.1:1".into(), "http://127.0.0.1:2".into()],
+            per_sec: 1000.0,
+            ..Default::default()
+        };
+        let lookup = Lookup::new(&config, &dir.join("prevouts.ndjson"))
+            .unwrap()
+            .unwrap();
+        let calls = AtomicUsize::new(0);
+        let answer = lookup
+            .first_answer(|_| async {
+                match calls.fetch_add(1, Ordering::Relaxed) {
+                    0 => Err("down".to_owned()),
+                    _ => Ok(7),
+                }
+            })
+            .await;
+        assert_eq!(answer, Ok(7));
+        let errors = lookup
+            .first_answer(|_| async { Err::<u32, _>("down".to_owned()) })
+            .await;
+        assert_eq!(errors, Err("down; down".to_owned()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
