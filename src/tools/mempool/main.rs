@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use tokio::{
     signal::unix::{signal, SignalKind},
     sync::mpsc,
+    time::MissedTickBehavior,
 };
 use tracing::{debug, error, info};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
@@ -58,6 +59,7 @@ const ALIVE_INTERVAL: Duration = Duration::from_secs(3600);
 /// A tx that returns this soon after `gone` is the same tx, not a new one.
 const GONE_MEMORY: Duration = Duration::from_secs(3600);
 const GAUGE_IDLE: Duration = Duration::from_secs(300);
+const TIP_INTERVAL: Duration = Duration::from_secs(30);
 /// The lookup's cache of parent output values, in the data dir.
 const PREVOUTS: &str = "prevouts.ndjson";
 /// 999 is the last bucket under the 1,000 zats per action floor.
@@ -287,6 +289,10 @@ async fn run(config: Config) -> Result<(), String> {
     info!("{} txs seen earlier today", seen_today.len());
     let lookup = Lookup::new(&config.lookup, &listener_config.data_dir.join(PREVOUTS))?;
     let (fees_tx, mut fees_rx) = mpsc::unbounded_channel();
+    let (tips_tx, mut tips_rx) = mpsc::unbounded_channel();
+    if let Some(lookup) = &lookup {
+        tokio::spawn(poll_tip(lookup.clone(), tips_tx));
+    }
     let mut core = Core::new(
         listener_config,
         listener,
@@ -303,6 +309,7 @@ async fn run(config: Config) -> Result<(), String> {
         tokio::select! {
             Some(event) = events_rx.recv() => core.on_node_event(event),
             Some((wtxid, fee)) = fees_rx.recv() => core.on_fee(wtxid, fee),
+            Some(height) = tips_rx.recv() => core.tip = Some(height),
             _ = tick.tick() => core.on_tick(),
             _ = tokio::signal::ctrl_c() => break,
             _ = sigterm.recv() => break,
@@ -315,6 +322,23 @@ async fn run(config: Config) -> Result<(), String> {
     core.listener.wire().close();
     info!("stopped");
     Ok(())
+}
+
+/// Sends the chain tip every `TIP_INTERVAL`. A failed poll keeps the last tip.
+async fn poll_tip(lookup: Lookup, tips: mpsc::UnboundedSender<u32>) {
+    let mut interval = tokio::time::interval(TIP_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        match lookup.tip().await {
+            Ok(height) => {
+                if tips.send(height).is_err() {
+                    return;
+                }
+            }
+            Err(e) => debug!("tip: {e}"),
+        }
+    }
 }
 
 /// A tx's wtxid and its lookup's fee.
@@ -392,6 +416,8 @@ struct Core {
     lookup: Option<(Lookup, mpsc::UnboundedSender<FeeResult>)>,
     /// Fetched txs that wait for a lookup, by wtxid.
     pending: HashMap<String, (SocketAddr, TxSummary)>,
+    /// The chain tip from the lookup servers. `None` without servers.
+    tip: Option<u32>,
     last_depth: Instant,
     last_alive: Option<Instant>,
     counts: Counts,
@@ -425,6 +451,7 @@ impl Core {
             rules,
             lookup: None,
             pending: HashMap::new(),
+            tip: None,
             last_depth: now,
             last_alive: None,
             counts: Counts::default(),
@@ -895,6 +922,7 @@ impl Core {
                     "secs": entry.last_seen.duration_since(entry.first_seen).as_secs(),
                     "peers": entry.announcers.len(),
                     "fetched": entry.size.is_some(),
+                    "tip_height": self.tip,
                 }),
             );
         }

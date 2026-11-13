@@ -61,6 +61,7 @@ impl Default for ListenerConfig {
 }
 
 /// Fees for txs with transparent inputs, from the spent outputs' parent txs on lightwalletd.
+/// The same servers give the chain tip.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LookupConfig {

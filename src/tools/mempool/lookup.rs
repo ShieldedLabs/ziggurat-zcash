@@ -1,9 +1,11 @@
 //! Fees for txs with transparent inputs. The listener asks lightwalletd for each spent
 //! output's parent tx, parses it with zebra-chain, and caches its output values on disk.
+//! The same servers give the chain tip, so `gone` events can say whether a tx expired.
 
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
+    future::Future,
     io::{self, BufRead, BufReader, Write},
     path::Path,
     sync::{
@@ -33,6 +35,7 @@ use zebra_chain::{
 use crate::config::LookupConfig;
 
 const GET_TRANSACTION: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTransaction";
+const GET_LATEST_BLOCK: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock";
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 // The lightwalletd messages this module uses, from `service.proto`.
@@ -48,6 +51,15 @@ struct RawTransaction {
     #[prost(bytes = "vec", tag = "1")]
     data: Vec<u8>,
     #[prost(uint64, tag = "2")]
+    height: u64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct ChainSpec {}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct BlockId {
+    #[prost(uint64, tag = "1")]
     height: u64,
 }
 
@@ -151,24 +163,54 @@ impl Lookup {
         Ok(())
     }
 
-    /// Asks each server in turn until one returns the tx.
+    /// The chain tip height.
+    pub async fn tip(&self) -> Result<u32, String> {
+        self.first_answer(get_latest_block).await
+    }
+
     async fn fetch(&self, txid: transaction::Hash) -> Result<Vec<i64>, String> {
-        let mut errors = Vec::new();
-        for _ in 0..self.servers.len() {
-            self.limiter.lock().await.tick().await;
-            let i = self.next.fetch_add(1, Ordering::Relaxed) % self.servers.len();
-            let result = get_transaction(self.servers[i].clone(), txid).await;
+        self.first_answer(|channel| async move {
+            let result = get_transaction(channel, txid).await;
             metrics::increment_counter!(
                 "mempool_fee_lookups_total",
                 "result" => if result.is_ok() { "ok" } else { "error" }
             );
-            match result {
-                Ok(values) => return Ok(values),
+            result
+        })
+        .await
+        .map_err(|e| format!("{txid}: {e}"))
+    }
+
+    /// Asks each server in turn until one answers.
+    async fn first_answer<T, F>(&self, call: impl Fn(Channel) -> F) -> Result<T, String>
+    where
+        F: Future<Output = Result<T, String>>,
+    {
+        let mut errors = Vec::new();
+        for _ in 0..self.servers.len() {
+            self.limiter.lock().await.tick().await;
+            let i = self.next.fetch_add(1, Ordering::Relaxed) % self.servers.len();
+            match call(self.servers[i].clone()).await {
+                Ok(answer) => return Ok(answer),
                 Err(e) => errors.push(e),
             }
         }
-        Err(format!("{txid}: {}", errors.join("; ")))
+        Err(errors.join("; "))
     }
+}
+
+async fn get_latest_block(channel: Channel) -> Result<u32, String> {
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.map_err(|e| e.to_string())?;
+    let response: tonic::Response<BlockId> = grpc
+        .unary(
+            tonic::Request::new(ChainSpec {}),
+            PathAndQuery::from_static(GET_LATEST_BLOCK),
+            tonic_prost::ProstCodec::default(),
+        )
+        .await
+        .map_err(|e| e.message().to_owned())?;
+    u32::try_from(response.into_inner().height).map_err(|e| e.to_string())
 }
 
 async fn get_transaction(channel: Channel, txid: transaction::Hash) -> Result<Vec<i64>, String> {
