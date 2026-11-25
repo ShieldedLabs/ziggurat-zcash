@@ -1,6 +1,6 @@
 # Mempool listener deployment
 
-The listener runs on the metrics VPS (`metrics.shieldedinfra.net`). It connects to about 50 Zebra and Zakura peers, logs mempool gossip, and exports Prometheus metrics. Grafana on the same host alerts on them.
+The listener runs on the metrics VPS (`metrics.shieldedinfra.net`). It connects to about 50 Zebra and Zakura peers, logs mempool gossip, block announcements and peer connections, and exports Prometheus metrics. Grafana on the same host alerts on them.
 
 ```mermaid
 flowchart LR
@@ -53,16 +53,22 @@ The listener counts its alerts in `mempool_alerts_total{rule}`, and Grafana aler
 | `mempool_snapshot_median`, `mempool_snapshot_median_bytes` | the median peer's mempool count and bytes. Each is a median over fresh snapshots, so one peer's backlog moves neither |
 | `mempool_live_bytes` | bytes of all fetched live txs, from every peer |
 | `mempool_peer_snapshot{peer,user_agent}` | each peer's latest mempool count (0 when stale); a dropped peer's series expires after 5 min |
+| `chain_peer_events_total{event}` | `peer_up`, `peer_down`, `connect_failed` and `turned_away` events |
+| `chain_peer_start_height{peer,user_agent}` | each ready peer's height at its handshake, by its own word |
+| `chain_block_announcements_total` | `block` events |
 | `mempool_alerts_total{rule}` | per-tx rule alerts |
 | `mempool_fee_lookups_total{result}` | lightwalletd calls for parent txs, `ok` or `error` |
 
 ## Events
 
-One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `event`. At each UTC day change the listener gzips the past days' files to `.ndjson.gz`. Expect about 50 MB a day in all.
+One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `event`. At each UTC day change the listener gzips the past days' files to `.ndjson.gz`. Expect about 50 MB a day for the tx events, and 9 to 26 MB for `block`.
 
 | Event | Meaning |
 |---|---|
-| `peer_up`, `peer_down` | a peer finished its handshake, or dropped |
+| `peer_up`, `peer_down` | a peer finished its handshake, or dropped. `peer_up` has the `protocol_version` and `start_height` from the peer's version message |
+| `connect_failed` | a dial failed, and `reason` says why |
+| `turned_away` | the connection ended before the peer's verack. `start_height` is null when its version never came |
+| `block` | a ready peer announced a block, logged once per peer while it's in that peer's last 200, up to 50 per inv and 200 a minute. `after_ms` is the time since the first connected peer announced it |
 | `seen` | a peer announced a tx by gossip, or a snapshot showed a tx new today |
 | `snapshot` | a peer answered `mempool` with `count` ids, `bytes` of them fetched |
 | `tx` | a fetched tx: counts, ZIP 317 actions, `fee` and `fee_source`. A tx with transparent inputs logs after its lookup |

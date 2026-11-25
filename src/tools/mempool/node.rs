@@ -19,7 +19,7 @@ use crate::wire::{Record, WireCodec, WireLog};
 
 pub enum NodeEvent {
     /// The peer sent its Version.
-    Version(SocketAddr, String),
+    Version(SocketAddr, Version),
     /// The peer sent Verack, so it accepts requests now.
     Ready(SocketAddr),
     Message(SocketAddr, Message),
@@ -137,9 +137,7 @@ impl Reading for Listener {
                     ..Record::event(source, "handshake")
                 });
                 self.send(source, Message::Verack);
-                let _ = self
-                    .events
-                    .send(NodeEvent::Version(source, version.user_agent.0));
+                let _ = self.events.send(NodeEvent::Version(source, version));
             }
             Message::Verack => {
                 let _ = self.events.send(NodeEvent::Ready(source));
