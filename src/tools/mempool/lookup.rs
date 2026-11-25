@@ -25,17 +25,20 @@ use tonic::{
     codegen::http::uri::PathAndQuery,
     transport::{Channel, ClientTlsConfig, Endpoint},
 };
+use tracing::debug;
 use zebra_chain::{
     amount::{Amount, NonNegative},
     serialization::ZcashDeserialize,
     transaction::{self, Transaction},
     transparent,
 };
+use ziggurat_zcash::protocol::payload::Hash;
 
 use crate::config::LookupConfig;
 
 const GET_TRANSACTION: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTransaction";
 const GET_LATEST_BLOCK: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock";
+const GET_BLOCK: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlock";
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 // The lightwalletd messages this module uses, from `service.proto`.
@@ -61,6 +64,15 @@ struct ChainSpec {}
 struct BlockId {
     #[prost(uint64, tag = "1")]
     height: u64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct CompactBlock {
+    #[prost(uint64, tag = "2")]
+    height: u64,
+    /// In the byte order peers use.
+    #[prost(bytes = "vec", tag = "3")]
+    hash: Vec<u8>,
 }
 
 /// Where a `tx` event's fee comes from.
@@ -163,9 +175,19 @@ impl Lookup {
         Ok(())
     }
 
-    /// The chain tip height.
-    pub async fn tip(&self) -> Result<u32, String> {
-        self.first_answer(get_latest_block).await
+    /// The chain tip height, from each server that answers.
+    pub async fn tips(&self) -> Vec<u32> {
+        self.each_answer(get_latest_block).await
+    }
+
+    pub fn servers(&self) -> usize {
+        self.servers.len()
+    }
+
+    /// The hash of the block at a height, on the server's best chain.
+    pub async fn block(&self, height: u32) -> Result<Hash, String> {
+        self.first_answer(|channel| get_block(channel, height))
+            .await
     }
 
     async fn fetch(&self, txid: transaction::Hash) -> Result<Vec<i64>, String> {
@@ -179,6 +201,22 @@ impl Lookup {
         })
         .await
         .map_err(|e| format!("{txid}: {e}"))
+    }
+
+    /// Asks every server, and keeps the answers that come.
+    async fn each_answer<T, F>(&self, call: impl Fn(Channel) -> F) -> Vec<T>
+    where
+        F: Future<Output = Result<T, String>>,
+    {
+        let mut answers = Vec::new();
+        for server in self.servers.iter() {
+            self.limiter.lock().await.tick().await;
+            match call(server.clone()).await {
+                Ok(answer) => answers.push(answer),
+                Err(e) => debug!("{e}"),
+            }
+        }
+        answers
     }
 
     /// Asks each server in turn until one answers.
@@ -215,6 +253,31 @@ async fn get_latest_block(channel: Channel) -> Result<u32, String> {
 
 fn tip_height(block: BlockId) -> Result<u32, String> {
     u32::try_from(block.height).map_err(|e| e.to_string())
+}
+
+async fn get_block(channel: Channel, height: u32) -> Result<Hash, String> {
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.map_err(|e| e.to_string())?;
+    let response: tonic::Response<CompactBlock> = grpc
+        .unary(
+            tonic::Request::new(BlockId {
+                height: height.into(),
+            }),
+            PathAndQuery::from_static(GET_BLOCK),
+            tonic_prost::ProstCodec::default(),
+        )
+        .await
+        .map_err(|e| e.message().to_owned())?;
+    block_hash(response.into_inner(), height)
+}
+
+/// The servers are public, so check that the block is the one we asked for.
+fn block_hash(block: CompactBlock, height: u32) -> Result<Hash, String> {
+    if block.height != u64::from(height) {
+        return Err(format!("server sent block {} for {height}", block.height));
+    }
+    let hash = <[u8; 32]>::try_from(block.hash).map_err(|h| format!("a {} byte hash", h.len()))?;
+    Ok(Hash::new(hash))
 }
 
 async fn get_transaction(channel: Channel, txid: transaction::Hash) -> Result<Vec<i64>, String> {
@@ -358,6 +421,20 @@ mod tests {
         assert!(tip_height(BlockId { height: 1 << 32 }).is_err());
     }
 
+    #[test]
+    fn block_hash_from_lightwalletd_bytes() {
+        // zec.rocks' GetBlock reply for 3,600,000 on 2026-11-25. ZecBlock shows the same hash.
+        let bytes = hex::decode(include_str!("testdata/block-3600000.hex").trim()).unwrap();
+        let block = <CompactBlock as prost::Message>::decode(&bytes[..]).unwrap();
+        assert_eq!(
+            crate::events::display_hex(&block_hash(block.clone(), 3_600_000).unwrap()),
+            "0000000000a994068a1704148a8af42c4878c53f5de3be870b4a465b6cffd842"
+        );
+        assert!(block_hash(block.clone(), 3_600_001).is_err());
+        let hash = vec![1; 31];
+        assert!(block_hash(CompactBlock { hash, ..block }, 3_600_000).is_err());
+    }
+
     #[tokio::test]
     async fn a_failed_server_passes_to_the_next() {
         let dir = std::env::temp_dir().join(format!("mempool-turns-{}", std::process::id()));
@@ -379,6 +456,19 @@ mod tests {
             })
             .await;
         assert_eq!(answer, Ok(7));
+        let calls = AtomicUsize::new(0);
+        let answers = lookup
+            .each_answer(|_| async {
+                match calls.fetch_add(1, Ordering::Relaxed) {
+                    0 => Err("down".to_owned()),
+                    n => Ok(n),
+                }
+            })
+            .await;
+        assert_eq!(answers, [1]);
+        assert_eq!(calls.into_inner(), 2);
+        let answers = lookup.each_answer(|_| async { Ok(5) }).await;
+        assert_eq!(answers, [5, 5]);
         let errors = lookup
             .first_answer(|_| async { Err::<u32, _>("down".to_owned()) })
             .await;

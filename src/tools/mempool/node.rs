@@ -146,7 +146,7 @@ impl Reading for Listener {
             Message::GetAddr => self.send(source, Message::Addr(Addr::empty())),
             Message::GetHeaders(_) => self.send(source, Message::Headers(Headers::empty())),
             Message::GetData(inv) => self.send(source, Message::NotFound(inv)),
-            Message::Inv(_) | Message::Tx(_) | Message::NotFound(_) => {
+            Message::Inv(_) | Message::Tx(_) | Message::NotFound(_) | Message::Headers(_) => {
                 let _ = self.events.send(NodeEvent::Message(source, message));
             }
             _ => {}

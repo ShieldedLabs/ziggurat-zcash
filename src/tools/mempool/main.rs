@@ -27,12 +27,14 @@ use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 use ziggurat_zcash::protocol::{
     message::Message,
     payload::{
+        block::{Headers, LocatorHashes},
         inv::{Inv, InvHash},
         Hash, Tx,
     },
 };
 
 use crate::{
+    chain::{Chain, Height, Locator, Tips},
     config::{Config, ListenerConfig},
     events::{display_hex, event_line, EventLog, SeenToday, TxIds, TxSummary},
     fetch::Fetches,
@@ -42,6 +44,7 @@ use crate::{
     rules::{Alert, Rules, RULES},
 };
 
+mod chain;
 mod config;
 mod events;
 mod fetch;
@@ -59,6 +62,10 @@ const ALIVE_INTERVAL: Duration = Duration::from_secs(3600);
 /// A tx that returns this soon after `gone` is the same tx, not a new one.
 const GONE_MEMORY: Duration = Duration::from_secs(3600);
 const GAUGE_IDLE: Duration = Duration::from_secs(300);
+/// Ask for headers with blocks this fresh. Past 160 blocks, an hour, every reply is full.
+const CHAIN_FRESH: Duration = Duration::from_secs(1800);
+/// The slowest real headers reply took 7.2 s.
+const HEADERS_REPLY: Duration = Duration::from_secs(10);
 /// The events that say what became of a connection to a peer.
 const PEER_EVENTS: [&str; 4] = ["peer_up", "peer_down", "connect_failed", "turned_away"];
 /// A peer announces one block at a time, or a few after a gap.
@@ -270,6 +277,9 @@ async fn run(config: Config) -> Result<(), String> {
         metrics::counter!("mempool_txs_seen_total", 0);
         metrics::counter!("mempool_txs_undecoded_total", 0);
         metrics::counter!("chain_block_announcements_total", 0);
+        for result in ["at", "at_most", "unplaced", "no_reply"] {
+            metrics::counter!("chain_headers_total", 0, "result" => result);
+        }
         for event in PEER_EVENTS {
             metrics::counter!("chain_peer_events_total", 0, "event" => event);
         }
@@ -321,7 +331,7 @@ async fn run(config: Config) -> Result<(), String> {
         tokio::select! {
             Some(event) = events_rx.recv() => core.on_node_event(event),
             Some((wtxid, fee)) = fees_rx.recv() => core.on_fee(wtxid, fee),
-            Some(height) = tips_rx.recv() => core.tip = Some(height),
+            Some(news) = tips_rx.recv() => core.on_chain(news),
             _ = tick.tick() => core.on_tick(),
             _ = tokio::signal::ctrl_c() => break,
             _ = sigterm.recv() => break,
@@ -336,20 +346,73 @@ async fn run(config: Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Sends the chain tip every `TIP_INTERVAL`. A failed poll keeps the last tip.
-async fn poll_tip(lookup: Lookup, tips: mpsc::UnboundedSender<u32>) {
+/// The blocks at these heights, or `None` if one of them can't be had.
+async fn fetch_blocks<F>(heights: &[u32], block: impl Fn(u32) -> F) -> Option<Locator>
+where
+    F: std::future::Future<Output = Result<Hash, String>>,
+{
+    let mut found = Vec::new();
+    for height in heights {
+        match block(*height).await {
+            Ok(hash) => found.push((*height, hash)),
+            Err(e) => {
+                debug!("block {height}: {e}");
+                return None;
+            }
+        }
+    }
+    Some(found)
+}
+
+/// What the lookup servers say of the chain.
+enum ChainNews {
+    Tip(u32),
+    Blocks { blocks: Locator, reset: bool },
+}
+
+/// Sends the chain tip every `TIP_INTERVAL`, and the blocks a locator needs. A failed poll
+/// keeps the last tip.
+async fn poll_tip(lookup: Lookup, news: mpsc::UnboundedSender<ChainNews>) {
+    let mut tips = Tips::default();
     let mut interval = tokio::time::interval(TIP_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        match lookup.tip().await {
-            Ok(height) => {
-                if tips.send(height).is_err() {
-                    return;
-                }
-            }
-            Err(e) => debug!("tip: {e}"),
+        let answers = lookup.tips().await;
+        on_tips(&mut tips, &answers, lookup.servers(), &news, |h| {
+            lookup.block(h)
+        })
+        .await;
+        if news.is_closed() {
+            return;
         }
+    }
+}
+
+/// Sends the servers' median tip, then the blocks a locator needs if most of them agree on it.
+async fn on_tips<F>(
+    tips: &mut Tips,
+    answers: &[u32],
+    servers: usize,
+    news: &mpsc::UnboundedSender<ChainNews>,
+    block: impl Fn(u32) -> F,
+) where
+    F: std::future::Future<Output = Result<Hash, String>>,
+{
+    let Some(tip) = chain::median(answers) else {
+        debug!("tip: no server answered");
+        return;
+    };
+    let _ = news.send(ChainNews::Tip(tip));
+    let Some(tip) = chain::agreed_tip(answers, servers) else {
+        debug!("tip: the servers disagree: {answers:?}");
+        return;
+    };
+    let wanted = tips.see(tip);
+    if let Some(blocks) = fetch_blocks(&wanted.heights, block).await {
+        tips.done(tip);
+        let reset = wanted.reset;
+        let _ = news.send(ChainNews::Blocks { blocks, reset });
     }
 }
 
@@ -363,6 +426,11 @@ struct PeerInfo {
     start_height: i32,
     /// The blocks this peer announced, oldest first.
     blocks: VecDeque<(Hash, Instant)>,
+    last_headers: Option<Instant>,
+    /// The headers request that waits for its reply, and the locator it carried.
+    asked: Option<(Instant, Locator)>,
+    /// The height the latest headers reply gave.
+    height: Option<(Instant, u32)>,
     ready_at: Option<Instant>,
     last_poll: Option<Instant>,
     awaiting_snapshot: Option<Instant>,
@@ -435,6 +503,9 @@ struct Core {
     pending: HashMap<String, (SocketAddr, TxSummary)>,
     /// The chain tip from the lookup servers. `None` without servers.
     tip: Option<u32>,
+    chain: Chain,
+    /// When a block at a new height last came.
+    chain_moved: Option<Instant>,
     last_depth: Instant,
     last_alive: Option<Instant>,
     counts: Counts,
@@ -469,9 +540,28 @@ impl Core {
             lookup: None,
             pending: HashMap::new(),
             tip: None,
+            chain: Chain::default(),
+            chain_moved: None,
             last_depth: now,
             last_alive: None,
             counts: Counts::default(),
+        }
+    }
+
+    fn on_chain(&mut self, news: ChainNews) {
+        match news {
+            ChainNews::Tip(height) => self.tip = Some(height),
+            ChainNews::Blocks { blocks, reset } => {
+                if reset {
+                    self.chain = Chain::default();
+                }
+                for (height, hash) in blocks {
+                    if !self.chain.has(height) {
+                        self.chain_moved = Some(Instant::now());
+                    }
+                    self.chain.insert(height, hash);
+                }
+            }
         }
     }
 
@@ -502,6 +592,9 @@ impl Core {
                         protocol_version: version.version.0,
                         start_height: version.start_height,
                         blocks: VecDeque::new(),
+                        last_headers: None,
+                        asked: None,
+                        height: None,
                         ready_at: None,
                         last_poll: None,
                         awaiting_snapshot: None,
@@ -560,6 +653,9 @@ impl Core {
             NodeEvent::Message(addr, Message::Inv(inv)) => {
                 self.on_blocks(addr, &inv, now);
                 self.on_inv(addr, inv, now);
+            }
+            NodeEvent::Message(addr, Message::Headers(headers)) => {
+                self.on_headers(addr, headers, now)
             }
             NodeEvent::Message(addr, Message::Tx(tx)) => self.on_tx(addr, tx, now),
             NodeEvent::Message(addr, Message::NotFound(inv)) => {
@@ -894,6 +990,88 @@ impl Core {
         }
     }
 
+    /// Asks the peer where its chain is, over the connection it already holds with us.
+    fn ask_headers(&mut self, addr: SocketAddr, now: Instant) {
+        let locator = self.chain.locator();
+        let fresh = self
+            .chain_moved
+            .is_some_and(|moved| now.duration_since(moved) < CHAIN_FRESH);
+        if locator.is_empty() || !fresh {
+            return;
+        }
+        if let Some(peer) = self.connected.get_mut(&addr) {
+            let hashes = locator.iter().map(|(_, hash)| *hash).collect();
+            peer.last_headers = Some(now);
+            peer.asked = Some((now, locator));
+            let request = LocatorHashes::new(hashes, Hash::zeroed());
+            self.listener.send(addr, Message::GetHeaders(request));
+        }
+    }
+
+    /// Logs the height a headers reply gives. A reply to no request is ignored.
+    fn on_headers(&mut self, addr: SocketAddr, headers: Headers, now: Instant) {
+        let Some(peer) = self.connected.get_mut(&addr) else {
+            return;
+        };
+        let Some((sent, locator)) = peer.asked.take() else {
+            return;
+        };
+        let found = chain::reply_height(&headers.headers, &locator);
+        let (result, height) = match found {
+            Height::At(height) => ("at", Some(height)),
+            Height::AtMost(height) => ("at_most", Some(height)),
+            Height::Unplaced => ("unplaced", None),
+        };
+        peer.height = match found {
+            Height::At(height) => Some((now, height)),
+            _ => None,
+        };
+        metrics::increment_counter!("chain_headers_total", "result" => result);
+        self.emit(
+            "height",
+            json!({
+                "peer": addr,
+                "height": height,
+                "at_most": result == "at_most",
+                "headers": headers.headers.len(),
+                "ms": now.duration_since(sent).as_millis() as u64,
+            }),
+        );
+    }
+
+    fn check_headers(&mut self, now: Instant) {
+        let every = Duration::from_secs(self.config.headers_poll_secs);
+        let mut silent = Vec::new();
+        let mut due = Vec::new();
+        for (addr, peer) in self
+            .connected
+            .iter_mut()
+            .filter(|(_, p)| p.ready_at.is_some())
+        {
+            if let Some((sent, _)) = &peer.asked {
+                if now.duration_since(*sent) < HEADERS_REPLY {
+                    continue;
+                }
+                peer.asked = None;
+                peer.height = None;
+                silent.push(*addr);
+            }
+            if peer
+                .last_headers
+                .is_none_or(|last| now.duration_since(last) >= every)
+            {
+                due.push(*addr);
+            }
+        }
+        for addr in silent {
+            metrics::increment_counter!("chain_headers_total", "result" => "no_reply");
+            self.emit("no_reply", json!({ "peer": addr }));
+        }
+        for addr in due {
+            self.ask_headers(addr, now);
+        }
+    }
+
     fn poll(&mut self, addr: SocketAddr, now: Instant) {
         if let Some(peer) = self.connected.get_mut(&addr) {
             peer.last_poll = Some(now);
@@ -924,6 +1102,8 @@ impl Core {
         for addr in due {
             self.poll(addr, now);
         }
+
+        self.check_headers(now);
 
         let timeout = Duration::from_secs(self.config.getdata_timeout_secs);
         let stale: Vec<String> = self
@@ -1028,6 +1208,18 @@ impl Core {
                 "peer" => addr.to_string(),
                 "user_agent" => peer.user_agent.clone()
             );
+            let fresh = Duration::from_secs(self.config.headers_poll_secs * 2);
+            // NaN leaves a gap when the peer's height isn't known now.
+            let height = peer
+                .height
+                .filter(|(at, _)| now.duration_since(*at) < fresh)
+                .map_or(f64::NAN, |(_, height)| f64::from(height));
+            metrics::gauge!(
+                "chain_peer_height",
+                height,
+                "peer" => addr.to_string(),
+                "user_agent" => peer.user_agent.clone()
+            );
             metrics::gauge!(
                 "chain_peer_start_height",
                 f64::from(peer.start_height),
@@ -1073,7 +1265,11 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
-    use ziggurat_zcash::protocol::payload::{VarStr, Version};
+    use pea2pea::protocols::Reading;
+    use ziggurat_zcash::protocol::payload::{
+        block::{Block, Header},
+        VarStr, Version,
+    };
 
     use super::*;
 
@@ -1275,6 +1471,223 @@ mod tests {
             .collect();
         assert!(after[2] >= 60, "{after:?}");
         assert_eq!(after[3], 0);
+    }
+
+    /// The first testnet headers, with the first one sampled at height 100.
+    fn sampled(core: &mut Core) -> Vec<Header> {
+        let headers: Vec<Header> = Block::initial_testnet_blocks()
+            .into_iter()
+            .map(|b| b.header)
+            .collect();
+        let blocks = vec![(100, headers[0].double_sha256().unwrap())];
+        core.on_chain(ChainNews::Blocks {
+            blocks,
+            reset: false,
+        });
+        headers
+    }
+
+    fn reply(core: &mut Core, peer: &str, headers: &[Header]) {
+        let message = Message::Headers(Headers::new(headers.to_vec()));
+        core.on_node_event(NodeEvent::Message(addr(peer), message));
+    }
+
+    #[tokio::test]
+    async fn a_headers_reply_is_a_height_event_once() {
+        let (mut core, dir) = core("headers");
+        let headers = sampled(&mut core);
+        up(&mut core, A);
+        core.ask_headers(addr(A), Instant::now());
+        reply(&mut core, A, &headers[1..4]);
+        reply(&mut core, A, &headers[1..3]);
+        let events = logged(&dir, "height");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["peer"], A);
+        assert_eq!(events[0]["height"], 103);
+        assert_eq!(events[0]["at_most"], false);
+        assert_eq!(core.connected[&addr(A)].height.unwrap().1, 103);
+    }
+
+    #[tokio::test]
+    async fn a_reply_we_cannot_place_gives_no_height() {
+        let (mut core, dir) = core("unplaced");
+        let headers = sampled(&mut core);
+        up(&mut core, A);
+        core.ask_headers(addr(A), Instant::now());
+        reply(&mut core, A, &headers[1..4]);
+        core.ask_headers(addr(A), Instant::now());
+        reply(&mut core, A, &headers[3..5]);
+        let events = logged(&dir, "height");
+        assert_eq!(events[1]["height"], Value::Null);
+        assert_eq!(core.connected[&addr(A)].height, None);
+    }
+
+    #[tokio::test]
+    async fn a_ready_peer_is_asked_every_interval() {
+        let (mut core, _dir) = core("asked");
+        up(&mut core, A);
+        core.on_tick();
+        // No sample yet, so there is nothing to ask with.
+        assert!(core.connected[&addr(A)].asked.is_none());
+        let headers = sampled(&mut core);
+        core.on_node_event(NodeEvent::Version(addr(B), version(1)));
+        core.on_tick();
+        assert!(core.connected[&addr(A)].asked.is_some());
+        assert!(core.connected[&addr(B)].asked.is_none());
+        reply(&mut core, A, &headers[1..2]);
+        core.on_tick();
+        assert!(core.connected[&addr(A)].asked.is_none());
+        let interval = Duration::from_secs(core.config.headers_poll_secs);
+        core.connected.get_mut(&addr(A)).unwrap().last_headers = Some(Instant::now() - interval);
+        core.on_tick();
+        assert!(core.connected[&addr(A)].asked.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_request_is_one_event() {
+        let (mut core, dir) = core("silent");
+        let headers = sampled(&mut core);
+        up(&mut core, A);
+        core.ask_headers(addr(A), Instant::now());
+        reply(&mut core, A, &headers[1..2]);
+        core.ask_headers(addr(A), Instant::now() - HEADERS_REPLY + TICK);
+        core.on_tick();
+        assert!(logged(&dir, "no_reply").is_empty());
+        let peer = core.connected.get_mut(&addr(A)).unwrap();
+        peer.asked.as_mut().unwrap().0 = Instant::now() - HEADERS_REPLY;
+        core.on_tick();
+        core.on_tick();
+        assert_eq!(logged(&dir, "no_reply").len(), 1);
+        assert_eq!(core.connected[&addr(A)].height, None);
+        // A reply that comes after that answers nothing.
+        reply(&mut core, A, &headers[1..2]);
+        assert_eq!(logged(&dir, "height").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blocks_come_all_or_none() {
+        let block = |h: u32| async move {
+            if h == 93 {
+                Err("down".to_owned())
+            } else {
+                Ok(Hash::zeroed())
+            }
+        };
+        assert_eq!(fetch_blocks(&[100, 93], block).await, None);
+        let found = fetch_blocks(&[100, 98], block).await.unwrap();
+        assert_eq!(found, [(100, Hash::zeroed()), (98, Hash::zeroed())]);
+    }
+
+    #[tokio::test]
+    async fn a_poll_follows_only_an_agreed_tip() {
+        let (news, mut received) = mpsc::unbounded_channel();
+        let mut tips = Tips::default();
+        let up = |_: u32| async { Ok(Hash::zeroed()) };
+        let mut polled = |answers: &'static [u32], block_up: bool| {
+            // Each poll ends at once, so there is nothing to wait for.
+            let poll = async {
+                if block_up {
+                    on_tips(&mut tips, answers, 3, &news, up).await;
+                } else {
+                    on_tips(&mut tips, answers, 3, &news, |_| async {
+                        Err("down".to_owned())
+                    })
+                    .await;
+                }
+            };
+            futures_util::FutureExt::now_or_never(poll).expect("no waits");
+            let mut got = Vec::new();
+            while let Ok(item) = received.try_recv() {
+                got.push(match item {
+                    ChainNews::Tip(tip) => (tip, None),
+                    ChainNews::Blocks { blocks, reset } => (blocks[0].0, Some(reset)),
+                });
+            }
+            got
+        };
+        assert_eq!(polled(&[], true), []);
+        // They disagree, so `gone` gets a tip and the locator gets nothing.
+        assert_eq!(polled(&[3_000_000, 3_600_000], true), [(3_000_000, None)]);
+        let agree: &[u32] = &[3_600_000, 3_600_000, 3_000_000];
+        assert_eq!(polled(agree, false), [(3_600_000, None)]);
+        let first = [(3_600_000, None), (3_599_997, Some(true))];
+        assert_eq!(polled(agree, true), first);
+        let next = [(3_600_000, None), (3_599_997, Some(false))];
+        assert_eq!(polled(agree, true), next);
+    }
+
+    fn news(core: &mut Core, heights: &[u32], reset: bool) {
+        let blocks = heights
+            .iter()
+            .map(|h| (*h, Hash::new([*h as u8; 32])))
+            .collect();
+        core.on_chain(ChainNews::Blocks { blocks, reset });
+    }
+
+    #[tokio::test]
+    async fn a_reset_drops_the_earlier_samples() {
+        let (mut core, _dir) = core("reset");
+        news(&mut core, &[100, 90], false);
+        news(&mut core, &[50], true);
+        let heights: Vec<u32> = core.chain.locator().iter().map(|b| b.0).collect();
+        assert_eq!(heights, [50]);
+    }
+
+    #[tokio::test]
+    async fn no_peer_is_asked_with_old_blocks() {
+        let (mut core, _dir) = core("stale");
+        up(&mut core, A);
+        news(&mut core, &[100], false);
+        let stale = Instant::now() + CHAIN_FRESH;
+        core.ask_headers(addr(A), stale);
+        assert!(core.connected[&addr(A)].asked.is_none());
+        // A server stuck on one block isn't news either.
+        let before = core.chain_moved;
+        news(&mut core, &[100], false);
+        assert_eq!(core.chain_moved, before);
+        news(&mut core, &[101], false);
+        assert!(core.chain_moved > before);
+        // A block under one that is too high is news.
+        news(&mut core, &[200], false);
+        let before = core.chain_moved;
+        news(&mut core, &[102], false);
+        assert!(core.chain_moved > before);
+        // So is a jump to a lower tip.
+        let before = core.chain_moved;
+        news(&mut core, &[50], true);
+        assert!(core.chain_moved > before);
+        core.ask_headers(addr(A), Instant::now());
+        assert!(core.connected[&addr(A)].asked.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_ceiling_is_marked_and_is_no_height() {
+        let (mut core, dir) = core("ceiling");
+        let headers = chain::full_reply();
+        up(&mut core, A);
+        core.on_chain(ChainNews::Blocks {
+            blocks: vec![(900, Hash::zeroed()), (500, headers[0].prev_block)],
+            reset: false,
+        });
+        core.ask_headers(addr(A), Instant::now());
+        reply(&mut core, A, &headers);
+        let events = logged(&dir, "height");
+        assert_eq!(events[0]["height"], 899);
+        assert_eq!(events[0]["at_most"], true);
+        assert_eq!(events[0]["headers"], 160);
+        assert_eq!(core.connected[&addr(A)].height, None);
+    }
+
+    #[tokio::test]
+    async fn a_headers_message_reaches_the_core() {
+        let (events, mut received) = mpsc::unbounded_channel();
+        let listener = Listener::new("/test/".into(), 1, events, wire::WireLog::off());
+        let message = Message::Headers(Headers::empty());
+        Reading::process_message(&listener, addr(A), message)
+            .await
+            .unwrap();
+        let event = received.try_recv().unwrap();
+        assert!(matches!(event, NodeEvent::Message(_, Message::Headers(_))));
     }
 
     #[tokio::test]
