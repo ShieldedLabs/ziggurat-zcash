@@ -501,9 +501,15 @@ impl Core {
             NodeEvent::ConnectFailed(addr, e) => {
                 debug!("connect to {addr} failed: {e}");
                 self.peers.failed(addr);
+                self.peers.ended(addr, now);
             }
             NodeEvent::Disconnected(addr) => {
                 let peer = self.connected.remove(&addr);
+                let open = self.peers.ended(addr, now);
+                // pea2pea's reader and writer can each report the same drop.
+                if peer.is_none() && !open {
+                    return;
+                }
                 match peer.as_ref().and_then(|p| p.ready_at) {
                     Some(ready_at) => {
                         let secs = now.duration_since(ready_at).as_secs();
@@ -511,7 +517,6 @@ impl Core {
                     }
                     None => self.peers.failed(addr),
                 }
-                self.peers.dropped(addr, now);
                 for wtxid in peer.into_iter().flat_map(|p| p.fetches.into_wtxids()) {
                     self.retry(&wtxid, now);
                 }

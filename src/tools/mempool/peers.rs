@@ -85,8 +85,9 @@ fn interleave(a: Vec<SocketAddr>, b: Vec<SocketAddr>) -> Vec<SocketAddr> {
 #[derive(Debug, Default)]
 struct PeerState {
     failures: u32,
-    last_attempt: Option<Instant>,
-    last_drop: Option<Instant>,
+    /// Dialed, and the end of that dial or connection isn't heard yet.
+    open: bool,
+    last_end: Option<Instant>,
 }
 
 /// The target peer slots plus spares to replace failing peers.
@@ -124,13 +125,16 @@ impl PeerSet {
         self.replace_failing();
         let mut due = Vec::new();
         for addr in &self.targets {
-            if is_up(*addr) {
+            let state = self.state.entry(*addr).or_default();
+            // pea2pea lists a connection as gone before the core hears of it.
+            if is_up(*addr) || state.open {
                 continue;
             }
-            let state = self.state.entry(*addr).or_default();
-            let last = state.last_attempt.max(state.last_drop);
-            if last.is_none_or(|last| now.duration_since(last) >= self.reconnect) {
-                state.last_attempt = Some(now);
+            if state
+                .last_end
+                .is_none_or(|end| now.duration_since(end) >= self.reconnect)
+            {
+                state.open = true;
                 due.push(*addr);
             }
         }
@@ -145,8 +149,12 @@ impl PeerSet {
         self.state.entry(addr).or_default().failures += 1;
     }
 
-    pub fn dropped(&mut self, addr: SocketAddr, now: Instant) {
-        self.state.entry(addr).or_default().last_drop = Some(now);
+    /// The peer's dial failed or its connection ended. The next dial waits from here.
+    /// Returns whether the peer was open.
+    pub fn ended(&mut self, addr: SocketAddr, now: Instant) -> bool {
+        let state = self.state.entry(addr).or_default();
+        state.last_end = Some(now);
+        std::mem::take(&mut state.open)
     }
 
     fn replace_failing(&mut self) {
@@ -159,7 +167,8 @@ impl PeerSet {
             if failing {
                 if let Some(spare) = self.spares.pop() {
                     self.targets[slot] = spare;
-                    self.state.remove(&addr);
+                    // Its last end stays, so it still waits before the next dial.
+                    self.state.entry(addr).or_default().failures = 0;
                     // Retry the failed peer once the spares run out.
                     self.spares.insert(0, addr);
                 }
@@ -225,8 +234,70 @@ mod tests {
         assert_eq!(due, vec![addr(3)]);
         assert_eq!(set.targets(), &[addr(3), addr(2)]);
 
-        set.dropped(addr(2), t0 + reconnect);
+        set.ended(addr(2), t0 + reconnect);
         assert!(set.due(t0 + reconnect, |a| a == addr(3)).is_empty());
         assert_eq!(set.due(t0 + 2 * reconnect, |a| a == addr(3)), vec![addr(2)]);
+    }
+
+    /// Every peer turns us away, as full nodes do, so the spares run out at once.
+    #[test]
+    fn a_failed_peer_waits_after_the_spares_run_out() {
+        let reconnect = Duration::from_secs(300);
+        let mut set = PeerSet::new((1..=150).map(addr).collect(), 50, reconnect, 1);
+        let t0 = Instant::now();
+        let mut dials: HashMap<SocketAddr, Vec<u64>> = HashMap::new();
+        for secs in (0..1200).step_by(5) {
+            let now = t0 + Duration::from_secs(secs);
+            for addr in set.due(now, |_| false) {
+                dials.entry(addr).or_default().push(secs);
+                set.failed(addr);
+                set.ended(addr, now);
+            }
+        }
+        assert_eq!(dials.len(), 150);
+        for times in dials.values() {
+            assert!(times.windows(2).all(|t| t[1] - t[0] >= 300), "{times:?}");
+            // Nor is it forgotten.
+            assert!(times.len() >= 3, "{times:?}");
+        }
+    }
+
+    #[test]
+    fn a_replaced_peer_waits_from_its_end_and_starts_clean() {
+        let mut set = PeerSet::new(vec![addr(1), addr(2)], 1, Duration::from_secs(300), 2);
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        assert_eq!(set.due(at(0), |_| false), vec![addr(1)]);
+        for (peer, secs, next) in [(1, 1000, vec![addr(2)]), (2, 1001, vec![])] {
+            set.failed(addr(peer));
+            set.failed(addr(peer));
+            set.ended(addr(peer), at(secs));
+            assert_eq!(set.due(at(secs), |_| false), next);
+        }
+        // 300 s from its end at 1000, not from its dial at 0.
+        assert!(set.due(at(1299), |_| false).is_empty());
+        assert_eq!(set.due(at(1300), |_| false), vec![addr(1)]);
+        // Its old failures are gone, so one more doesn't replace it.
+        set.failed(addr(1));
+        set.due(at(1301), |_| false);
+        assert_eq!(set.targets(), &[addr(1)]);
+    }
+
+    #[test]
+    fn a_dial_is_open_until_its_end_is_heard() {
+        let mut set = PeerSet::new(vec![addr(1)], 1, Duration::from_secs(300), 1);
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        assert_eq!(set.due(at(0), |_| false), vec![addr(1)]);
+        // Gone from pea2pea, but the core hasn't handled the event yet.
+        assert!(set.due(at(400), |_| false).is_empty());
+        set.ended(addr(1), at(405));
+        assert!(set.due(at(704), |_| false).is_empty());
+        assert_eq!(set.due(at(705), |_| false), vec![addr(1)]);
+        // A dial that ends late counts from its end.
+        set.ended(addr(1), at(780));
+        assert!(set.due(at(1079), |_| false).is_empty());
+        assert!(set.due(at(1080), |a| a == addr(1)).is_empty());
+        assert_eq!(set.due(at(1080), |_| false), vec![addr(1)]);
     }
 }
