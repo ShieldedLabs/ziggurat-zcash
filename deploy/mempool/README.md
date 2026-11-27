@@ -1,11 +1,12 @@
 # Mempool listener deployment
 
-The listener runs on the metrics VPS (`metrics.shieldedinfra.net`). It connects to about 50 Zebra and Zakura peers, logs mempool gossip, and exports Prometheus metrics. Grafana on the same host alerts on them.
+The listener runs on the metrics VPS (`metrics.shieldedinfra.net`). It connects to about 50 Zebra and Zakura peers, logs mempool gossip, block announcements and each peer's chain height, and exports Prometheus metrics. Grafana on the same host alerts on them.
 
 ```mermaid
 flowchart LR
-  P["Zebra/Zakura peers"] -->|inv, tx| L[listener]
-  L -->|getdata, mempool| P
+  P["Zebra/Zakura peers"] -->|inv, tx, headers| L[listener]
+  L -->|getdata, mempool, getheaders| P
+  S["lightwalletd servers"] -->|tip, txs, blocks| L
   L --> D["data/mempool/*.ndjson(.gz)"]
   M["Prometheus + Grafana<br/>(same host)"] -->|"mempool-listener:9101 on metrics-net"| L
   M -->|alerts| Phone
@@ -53,16 +54,27 @@ The listener counts its alerts in `mempool_alerts_total{rule}`, and Grafana aler
 | `mempool_snapshot_median`, `mempool_snapshot_median_bytes` | the median peer's mempool count and bytes. Each is a median over fresh snapshots, so one peer's backlog moves neither |
 | `mempool_live_bytes` | bytes of all fetched live txs, from every peer |
 | `mempool_peer_snapshot{peer,user_agent}` | each peer's latest mempool count (0 when stale); a dropped peer's series expires after 5 min |
+| `chain_peer_events_total{event}` | `peer_up`, `peer_down`, `connect_failed` and `turned_away` events |
+| `chain_peer_start_height{peer,user_agent}` | each ready peer's height at its handshake, by its own word |
+| `chain_peer_height{peer,user_agent}` | each ready peer's height from its latest headers reply, NaN when it isn't known |
+| `chain_headers_total{result}` | headers requests by outcome: `at`, `at_most`, `unplaced`, `no_reply` |
+| `chain_block_announcements_total` | `block` events |
+| `chain_tip_height` | the tip from the lookup servers, the median of their answers |
 | `mempool_alerts_total{rule}` | per-tx rule alerts |
 | `mempool_fee_lookups_total{result}` | lightwalletd calls for parent txs, `ok` or `error` |
 
 ## Events
 
-One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `event`. At each UTC day change the listener gzips the past days' files to `.ndjson.gz`. Expect about 50 MB a day in all.
+One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `event`. At each UTC day change the listener gzips the past days' files to `.ndjson.gz`. Expect about 50 MB a day for the tx events, about 16 MB for `height` with 50 peers, and 9 to 26 MB for `block`.
 
 | Event | Meaning |
 |---|---|
-| `peer_up`, `peer_down` | a peer finished its handshake, or dropped |
+| `peer_up`, `peer_down` | a peer finished its handshake, or dropped. `peer_up` has the `protocol_version` and `start_height` from the peer's version message |
+| `connect_failed` | a dial failed, and `reason` says why |
+| `turned_away` | the connection ended before the peer's verack. `start_height` is null when its version never came |
+| `height` | a ready peer answered our headers request. `height` is where its chain ends, `at_most` marks a ceiling from a full reply, and null means we couldn't place the reply. `headers` is the reply's count and `ms` is the wait |
+| `no_reply` | a headers request got no reply in 10 s |
+| `block` | a ready peer announced a block, logged once per peer while it's in that peer's last 200, up to 50 per inv and 200 a minute. `after_ms` is the time since the first connected peer announced it |
 | `seen` | a peer announced a tx by gossip, or a snapshot showed a tx new today |
 | `snapshot` | a peer answered `mempool` with `count` ids, `bytes` of them fetched |
 | `tx` | a fetched tx: counts, ZIP 317 actions, `fee` and `fee_source`. A tx with transparent inputs logs after its lookup |
@@ -71,6 +83,14 @@ One line per event in `mempool-YYYYMMDD.ndjson`, with `t` (unix seconds) and `ev
 | `back` | a tx marked gone returned within an hour (rebroadcast, or a node re-added it); it isn't counted or fetched again |
 | `alert` | a per-tx rule fired |
 | `alive`, `stop` | hourly counts, and the counts at shutdown |
+
+## Headers
+
+Every `headers_poll_secs` the listener asks each ready peer for headers, on the connection it already holds. The request lists block hashes from the `[lookup] servers` (gRPC `GetBlock`), from 3 blocks under the tip back to 100,000. The block a reply starts from, plus its header count, is the peer's height. The reply's headers must link to each other. The listener doesn't check their work, and the servers are public, so a height needs a second source before an alert relies on it. With no servers it asks nothing. It also asks nothing once no block at a new height has come for 30 minutes, because every reply is a full one after 160 blocks.
+
+Each poll asks every server for its tip and takes the median, if most of the servers are within 100 blocks of it. So list at least three servers: with two, one that is stuck stops the headers requests. When the tip moves more than 100 blocks between polls, the listener drops its blocks and fetches a new set.
+
+A Zebra peer may send nothing when its tip is exactly the newest listed block it has, which logs a `no_reply`. A reply that comes after its `no_reply` and after the next request is read as the answer to that request.
 
 ## Fees
 

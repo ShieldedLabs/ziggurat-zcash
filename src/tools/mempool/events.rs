@@ -48,7 +48,7 @@ impl TxIds {
     }
 }
 
-fn display_hex(hash: &Hash) -> String {
+pub fn display_hex(hash: &Hash) -> String {
     let mut bytes = *hash.as_bytes();
     bytes.reverse();
     hex::encode(bytes)

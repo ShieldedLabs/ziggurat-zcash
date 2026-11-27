@@ -33,6 +33,8 @@ pub struct ListenerConfig {
     pub user_agent: String,
     pub metrics_addr: Option<SocketAddr>,
     pub mempool_poll_secs: u64,
+    /// How often to ask each peer for headers. It needs `[lookup] servers`.
+    pub headers_poll_secs: u64,
     pub getdata_timeout_secs: u64,
     /// A tx missing from every snapshot and inv for this long gets a `gone` event.
     pub gone_after_secs: u64,
@@ -52,6 +54,7 @@ impl Default for ListenerConfig {
             user_agent: "/zero-mempool:0.1.0/".into(),
             metrics_addr: None,
             mempool_poll_secs: 60,
+            headers_poll_secs: 30,
             getdata_timeout_secs: 30,
             gone_after_secs: 600,
             reconnect_secs: 120,
