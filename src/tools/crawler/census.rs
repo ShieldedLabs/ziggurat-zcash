@@ -15,7 +15,7 @@ use serde::Serialize;
 
 use ziggurat_zcash::protocol::message::constants::NU7_PROTOCOL_VERSION;
 
-use crate::network::KnownNode;
+use crate::network::{Gossip, KnownNode};
 
 /// Flux's P2P port. Flux forked zcashd and answers on the Zcash mainnet magic.
 pub const FLUX_P2P_PORT: u16 = 16125;
@@ -134,6 +134,9 @@ pub struct CensusRecord<'a> {
     last_seen: String,
     handshake_ms: Option<u64>,
     chain: Chain,
+    clock_offset_s: Option<i64>,
+    attempts: u32,
+    versions: u32,
 }
 
 impl<'a> CensusRecord<'a> {
@@ -154,8 +157,99 @@ impl<'a> CensusRecord<'a> {
             last_seen: rfc3339(node.last_seen?),
             handshake_ms: node.handshake_time.map(|time| time.as_millis() as u64),
             chain: classify_chain(addr.port(), user_agent, start_height, zcash_tip),
+            clock_offset_s: node.clock_offset_s,
+            attempts: node.connection_attempts,
+            // A node can send Version twice on one connection.
+            versions: node.versions.min(node.connection_attempts),
         })
     }
+}
+
+/// One NDJSON line of the unanswered export: an attempted address that sent no Version.
+#[derive(Debug, Serialize)]
+struct Unanswered<'a> {
+    ip: IpAddr,
+    port: u16,
+    attempts: u32,
+    /// TCP connected, and our Version message sent.
+    tcp_connected: bool,
+    reason: &'a str,
+}
+
+impl<'a> Unanswered<'a> {
+    fn new(addr: SocketAddr, node: &'a KnownNode) -> Option<Self> {
+        (node.connection_attempts > 0 && node.protocol_version.is_none()).then(|| Self {
+            ip: addr.ip(),
+            port: addr.port(),
+            attempts: node.connection_attempts,
+            tcp_connected: node.last_connected.is_some(),
+            reason: no_version_reason(node),
+        })
+    }
+}
+
+/// Why an attempted node sent no Version message.
+fn no_version_reason(node: &KnownNode) -> &str {
+    match (&node.last_failure, node.last_connected) {
+        (Some(failure), _) => failure,
+        (None, Some(_)) => "connected, no Version yet",
+        (None, None) => "connect in progress",
+    }
+}
+
+/// One NDJSON line of the gossip export: `from` told us about `addr`.
+#[derive(Serialize)]
+struct GossipRecord {
+    from: SocketAddr,
+    addr: SocketAddr,
+    services: u64,
+    last_seen: i64,
+}
+
+/// Writes `gossip-<run start>.ndjson.gz` into `dir` and returns its path.
+pub fn write_gossip(gossip: &Gossip, dir: &Path, run_start: DateTime<Utc>) -> io::Result<PathBuf> {
+    let mut records: Vec<GossipRecord> = gossip
+        .iter()
+        .flat_map(|(from, addrs)| {
+            addrs.iter().map(|(addr, said)| GossipRecord {
+                from: *from,
+                addr: *addr,
+                services: said.services,
+                last_seen: said.last_seen,
+            })
+        })
+        .collect();
+    records.sort_by_key(|record| (record.from, record.addr));
+    write_lines(dir, "gossip", run_start, &records)
+}
+
+/// Writes `<name>-<run start>.ndjson.gz` into `dir` and returns its path.
+///
+/// Each call replaces the file of the same run. The write goes to a temporary file
+/// first, so a reader never sees a partial file.
+fn write_lines<T: Serialize>(
+    dir: &Path,
+    name: &str,
+    run_start: DateTime<Utc>,
+    records: &[T],
+) -> io::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join(format!(
+        "{name}-{}.ndjson.gz",
+        run_start.format("%Y%m%dT%H%M%SZ")
+    ));
+    let tmp_path = path.with_extension("gz.tmp");
+
+    let file = BufWriter::new(File::create(&tmp_path)?);
+    let mut gz = GzEncoder::new(file, Compression::default());
+    for record in records {
+        serde_json::to_writer(&mut gz, record)?;
+        gz.write_all(b"\n")?;
+    }
+    gz.finish()?.flush()?;
+    fs::rename(&tmp_path, &path)?;
+
+    Ok(path)
 }
 
 /// How far the crawl got with the known addresses.
@@ -182,12 +276,7 @@ impl<'a> Funnel<'a> {
             funnel.connected += node.last_connected.is_some() as usize;
 
             if node.protocol_version.is_none() {
-                let reason = match (&node.last_failure, node.last_connected) {
-                    (Some(failure), _) => failure.as_str(),
-                    (None, Some(_)) => "connected, no Version yet",
-                    (None, None) => "connect in progress",
-                };
-                *failures.entry(reason).or_default() += 1;
+                *failures.entry(no_version_reason(node)).or_default() += 1;
             }
         }
 
@@ -204,6 +293,7 @@ pub struct Census<'a> {
     /// The tip used for the height rule: the given tip, else the Zebra and Zakura median.
     zcash_tip: Option<i32>,
     records: Vec<CensusRecord<'a>>,
+    unanswered: Vec<Unanswered<'a>>,
     funnel: Funnel<'a>,
 }
 
@@ -217,35 +307,81 @@ impl<'a> Census<'a> {
             .collect();
         records.sort_by_key(|record| (record.ip, record.port));
 
+        let mut unanswered: Vec<_> = nodes
+            .iter()
+            .filter_map(|(addr, node)| Unanswered::new(*addr, node))
+            .collect();
+        unanswered.sort_by_key(|record| (record.ip, record.port));
+
         Self {
             zcash_tip,
             records,
+            unanswered,
             funnel: Funnel::new(nodes),
         }
     }
 
-    /// Writes `census-<run start>.ndjson.gz` into `dir` and returns its path.
-    ///
-    /// Each call replaces the file of the same run. The write goes to a temporary file
-    /// first, so a reader never sees a partial file.
+    /// Writes `unanswered-<run start>.ndjson.gz` and `census-<run start>.ndjson.gz` into
+    /// `dir` and returns the census path.
     pub fn write_ndjson_gz(&self, dir: &Path, run_start: DateTime<Utc>) -> io::Result<PathBuf> {
-        fs::create_dir_all(dir)?;
-        let path = dir.join(format!(
-            "census-{}.ndjson.gz",
-            run_start.format("%Y%m%dT%H%M%SZ")
-        ));
-        let tmp_path = path.with_extension("gz.tmp");
+        write_lines(dir, "unanswered", run_start, &self.unanswered)?;
+        write_lines(dir, "census", run_start, &self.records)
+    }
+}
 
-        let file = BufWriter::new(File::create(&tmp_path)?);
-        let mut gz = GzEncoder::new(file, Compression::default());
-        for record in &self.records {
-            serde_json::to_writer(&mut gz, record)?;
-            gz.write_all(b"\n")?;
-        }
-        gz.finish()?.flush()?;
-        fs::rename(&tmp_path, &path)?;
+/// One line per census describing the run itself, so a reader can tell a finished crawl
+/// from one that was killed, or whose network dropped, before trusting its counts.
+#[derive(Serialize)]
+struct RunRecord<'a> {
+    run_start: String,
+    written_at: String,
+    /// Only the write at a clean exit is complete. A killed run keeps its last interval's false.
+    complete: bool,
+    known: usize,
+    attempted: usize,
+    connected: usize,
+    sent_version: usize,
+    /// The latest `last_seen` of any node. Far behind `written_at` means the crawl went deaf.
+    newest_version: Option<&'a str>,
+    tip: Option<i32>,
+}
 
-        Ok(path)
+impl Census<'_> {
+    /// Writes `run-<run start>.ndjson.gz`, replacing the earlier write of the same run.
+    pub fn write_run(
+        &self,
+        dir: &Path,
+        run_start: DateTime<Utc>,
+        written_at: DateTime<Utc>,
+        complete: bool,
+    ) -> io::Result<PathBuf> {
+        let record = RunRecord {
+            run_start: rfc3339(run_start),
+            written_at: rfc3339(written_at),
+            complete,
+            known: self.funnel.known,
+            attempted: self.funnel.attempted,
+            connected: self.funnel.connected,
+            sent_version: self.records.len(),
+            newest_version: self.records.iter().map(|r| r.last_seen.as_str()).max(),
+            tip: self.zcash_tip,
+        };
+        write_lines(dir, "run", run_start, &[record])
+    }
+
+    /// Writes the census files, then the run record. The run is complete only when `finished`
+    /// (the run reached its duration) and the census was written, so a run stopped early, or
+    /// one whose census write failed, stays partial. Returns the census path, or the first error.
+    pub fn export(
+        &self,
+        dir: &Path,
+        run_start: DateTime<Utc>,
+        written_at: DateTime<Utc>,
+        finished: bool,
+    ) -> io::Result<PathBuf> {
+        let census = self.write_ndjson_gz(dir, run_start);
+        self.write_run(dir, run_start, written_at, finished && census.is_ok())?;
+        census
     }
 }
 
@@ -331,13 +467,16 @@ mod tests {
     use ziggurat_zcash::protocol::payload::{ProtocolVersion, VarStr};
 
     use super::*;
+    use crate::network::GossipedAddr;
 
     const TIP: Option<i32> = Some(3_500_000);
 
     fn node(user_agent: &str, start_height: i32) -> KnownNode {
         let seen = Utc.with_ymd_and_hms(2026, 10, 12, 14, 0, 0).unwrap();
         KnownNode {
-            connection_attempts: 1,
+            connection_attempts: 4,
+            versions: 3,
+            clock_offset_s: Some(-300),
             last_connected: Some(Instant::now()),
             handshake_time: Some(Duration::from_millis(42)),
             protocol_version: Some(ProtocolVersion(NU7_PROTOCOL_VERSION)),
@@ -411,7 +550,8 @@ mod tests {
                 r#"{"ip":"192.0.2.1","port":8233,"protocol_version":170190,"#,
                 r#""user_agent":"/Zebra:4.1.0/","services":1,"start_height":3500000,"#,
                 r#""relay":true,"first_seen":"2026-10-12T14:00:00Z","#,
-                r#""last_seen":"2026-10-12T14:05:00Z","handshake_ms":42,"chain":"zcash"}"#
+                r#""last_seen":"2026-10-12T14:05:00Z","handshake_ms":42,"chain":"zcash","#,
+                r#""clock_offset_s":-300,"attempts":4,"versions":3}"#
             )
         );
 
@@ -507,8 +647,193 @@ mod tests {
             .read_to_string(&mut ndjson)
             .unwrap();
         assert_eq!(ndjson.lines().count(), 1);
-        assert!(ndjson.ends_with("\"chain\":\"zcash\"}\n"));
+        assert!(ndjson.ends_with("\"versions\":3}\n"));
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every line of a written file.
+    fn lines(path: &Path) -> Vec<String> {
+        let mut text = String::new();
+        io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(File::open(path).unwrap()),
+            &mut text,
+        )
+        .unwrap();
+        text.lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn each_write_records_the_run_and_only_the_exit_write_calls_it_complete() {
+        let nodes = HashMap::from([
+            (
+                "192.0.2.1:8233".parse().unwrap(),
+                node("/Zebra:4.1.0/", 3_500_000),
+            ),
+            ("192.0.2.2:8233".parse().unwrap(), KnownNode::default()),
+        ]);
+        let dir = std::env::temp_dir().join(format!("run-test-{}", std::process::id()));
+        let run_start = Utc.with_ymd_and_hms(2026, 10, 12, 14, 0, 0).unwrap();
+        let census = Census::new(&nodes, TIP);
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&lines(&dir.join("run-20261012T140000Z.ndjson.gz"))[0]).unwrap()
+        };
+
+        census
+            .write_run(
+                &dir,
+                run_start,
+                run_start + chrono::Duration::minutes(30),
+                false,
+            )
+            .unwrap();
+        let run = read();
+        assert_eq!(run["complete"], false);
+        assert_eq!(run["written_at"], "2026-10-12T14:30:00Z");
+        assert_eq!(run["sent_version"], 1);
+        assert_eq!(run["attempted"], 1);
+        assert_eq!(run["known"], 2);
+        assert_eq!(run["newest_version"], census.records[0].last_seen.as_str());
+        assert_eq!(run["tip"], TIP.unwrap());
+
+        census
+            .write_run(
+                &dir,
+                run_start,
+                run_start + chrono::Duration::hours(1),
+                true,
+            )
+            .unwrap();
+        assert_eq!(read()["complete"], true);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn export_is_complete_only_when_finished_and_the_census_was_written() {
+        let nodes = HashMap::from([(
+            "192.0.2.1:8233".parse().unwrap(),
+            node("/Zebra:4.1.0/", 3_500_000),
+        )]);
+        let dir = std::env::temp_dir().join(format!("export-test-{}", std::process::id()));
+        let run_start = Utc.with_ymd_and_hms(2026, 10, 12, 14, 0, 0).unwrap();
+        let census = Census::new(&nodes, TIP);
+        let complete = || -> serde_json::Value {
+            let line = &lines(&dir.join("run-20261012T140000Z.ndjson.gz"))[0];
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["complete"].clone()
+        };
+
+        census.export(&dir, run_start, run_start, false).unwrap();
+        assert_eq!(complete(), false); // an interval write
+        assert!(dir.join("census-20261012T140000Z.ndjson.gz").exists());
+        census.export(&dir, run_start, run_start, true).unwrap();
+        assert_eq!(complete(), true); // the run reached its duration
+
+        // The census can't be written: the run record still goes out, and says partial.
+        fs::remove_file(dir.join("census-20261012T140000Z.ndjson.gz")).unwrap();
+        fs::create_dir(dir.join("census-20261012T140000Z.ndjson.gz")).unwrap();
+        assert!(census.export(&dir, run_start, run_start, true).is_err());
+        assert_eq!(complete(), false);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn newest_version_is_the_latest_of_many_nodes() {
+        let older = KnownNode {
+            last_seen: Some(Utc.with_ymd_and_hms(2026, 10, 12, 13, 0, 0).unwrap()),
+            ..node("/Zebra:4.1.0/", 3_500_000)
+        };
+        let newer = KnownNode {
+            last_seen: Some(Utc.with_ymd_and_hms(2026, 10, 12, 13, 30, 0).unwrap()),
+            ..node("/Zebra:4.1.0/", 3_500_000)
+        };
+        let nodes = HashMap::from([
+            ("192.0.2.1:8233".parse().unwrap(), older),
+            ("192.0.2.2:8233".parse().unwrap(), newer),
+        ]);
+        let dir = std::env::temp_dir().join(format!("newest-test-{}", std::process::id()));
+        let run_start = Utc.with_ymd_and_hms(2026, 10, 12, 13, 0, 0).unwrap();
+        Census::new(&nodes, TIP)
+            .write_run(&dir, run_start, run_start, true)
+            .unwrap();
+        let line = &lines(&dir.join("run-20261012T130000Z.ndjson.gz"))[0];
+        let run: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(run["newest_version"], "2026-10-12T13:30:00Z");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn versions_never_exceed_attempts() {
+        let node = KnownNode {
+            versions: 9,
+            ..node("/Zebra:4.1.0/", 3_500_000)
+        };
+        let record = CensusRecord::new("192.0.2.1:8233".parse().unwrap(), &node, TIP).unwrap();
+        assert_eq!(record.versions, 4);
+    }
+
+    #[test]
+    fn unanswered_lists_each_attempted_address_without_a_version() {
+        let nodes = HashMap::from([
+            (
+                "192.0.2.1:8233".parse().unwrap(),
+                node("/Zebra:4.1.0/", 3_500_000),
+            ),
+            ("192.0.2.2:8233".parse().unwrap(), KnownNode::default()),
+            (
+                "192.0.2.3:8233".parse().unwrap(),
+                KnownNode {
+                    connection_attempts: 3,
+                    last_connected: Some(Instant::now()),
+                    last_failure: Some("closed before Version".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "[2001:db8::1]:8233".parse().unwrap(),
+                KnownNode {
+                    connection_attempts: 2,
+                    last_failure: Some("refused".into()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let dir = std::env::temp_dir().join(format!("unanswered-test-{}", std::process::id()));
+        let run_start = Utc.with_ymd_and_hms(2026, 10, 12, 14, 0, 0).unwrap();
+        Census::new(&nodes, TIP)
+            .write_ndjson_gz(&dir, run_start)
+            .unwrap();
+        assert_eq!(
+            lines(&dir.join("unanswered-20261012T140000Z.ndjson.gz")),
+            [
+                r#"{"ip":"192.0.2.3","port":8233,"attempts":3,"tcp_connected":true,"reason":"closed before Version"}"#,
+                r#"{"ip":"2001:db8::1","port":8233,"attempts":2,"tcp_connected":false,"reason":"refused"}"#,
+            ]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gossip_lists_who_told_us_about_whom() {
+        let gossip = Gossip::from([(
+            "192.0.2.1:8233".parse().unwrap(),
+            HashMap::from([(
+                "192.0.2.9:18233".parse().unwrap(),
+                GossipedAddr {
+                    services: 1,
+                    last_seen: 1_795_600_000,
+                },
+            )]),
+        )]);
+        let dir = std::env::temp_dir().join(format!("gossip-test-{}", std::process::id()));
+        let run_start = Utc.with_ymd_and_hms(2026, 10, 12, 14, 0, 0).unwrap();
+        let path = write_gossip(&gossip, &dir, run_start).unwrap();
+        assert_eq!(path, dir.join("gossip-20261012T140000Z.ndjson.gz"));
+        assert_eq!(
+            lines(&path),
+            [
+                r#"{"from":"192.0.2.1:8233","addr":"192.0.2.9:18233","services":1,"last_seen":1795600000}"#
+            ]
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

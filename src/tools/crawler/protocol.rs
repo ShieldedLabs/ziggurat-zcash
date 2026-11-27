@@ -6,6 +6,7 @@ use pea2pea::{
     protocols::{Disconnect, Handshake, Reading, Writing},
     Config, Connection, ConnectionSide, Node as Pea2PeaNode, Pea2Pea,
 };
+use time::OffsetDateTime;
 use tokio_util::codec::Framed;
 use tracing::*;
 use ziggurat_zcash::{
@@ -160,6 +161,7 @@ impl Reading for Crawler {
                 }
 
                 self.known_network.add_addrs(source, &listening_addrs);
+                self.known_network.add_gossip(source, &addr.addrs);
 
                 // Disconnect after getting more than 1 addresses or if the received address is
                 // not the same as the source address.
@@ -189,6 +191,7 @@ impl Reading for Crawler {
             Message::Version(ver) => {
                 // Update source node with information from version.
                 if let Some(known_node) = self.known_network.nodes.write().get_mut(&source) {
+                    known_node.saw_version(ver.timestamp, OffsetDateTime::now_utc());
                     known_node.protocol_version = Some(ver.version);
                     known_node.user_agent = Some(ver.user_agent);
                     known_node.services = Some(ver.services);
@@ -239,5 +242,37 @@ impl Disconnect for Crawler {
             }
             known_node.state = ConnectionState::Disconnected;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ziggurat_zcash::protocol::payload::addr::NetworkAddr;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn version_and_addr_messages_reach_the_export() {
+        let source: SocketAddr = ([192, 0, 2, 1], 8233).into();
+        let other: SocketAddr = ([192, 0, 2, 2], 8233).into();
+        let crawler = Crawler::new("/test/".into()).await;
+        crawler
+            .known_network
+            .nodes
+            .write()
+            .insert(source, Default::default());
+
+        // The reply fails, because nothing is connected.
+        let version = Version::new(source, other);
+        let _ = crawler
+            .process_message(source, Message::Version(version))
+            .await;
+        let addr = Addr::new(vec![NetworkAddr::new(other)]);
+        let _ = crawler.process_message(source, Message::Addr(addr)).await;
+
+        let node = crawler.known_network.nodes()[&source].clone();
+        assert_eq!(node.versions, 1);
+        assert!(node.clock_offset_s.unwrap().abs() <= 1);
+        assert!(crawler.known_network.gossip.read()[&source].contains_key(&other));
     }
 }

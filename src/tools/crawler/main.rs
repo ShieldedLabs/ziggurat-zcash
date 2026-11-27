@@ -27,7 +27,7 @@ use ziggurat_core_crawler::summary::NetworkSummary;
 use ziggurat_zcash::wait_until;
 
 use crate::{
-    census::Census,
+    census::{write_gossip, Census},
     metrics::{NetworkMetrics, ZCASH_P2P_DEFAULT_MAINNET_PORT},
     network::{ConnectionState, KnownNode},
     protocol::{
@@ -71,7 +71,9 @@ struct Args {
     user_agent: String,
 
     /// If present, write census-<UTC start>.ndjson.gz (one line per node that sent its
-    /// Version message) to this directory after each crawl interval and on exit
+    /// Version message) and unanswered-<UTC start>.ndjson.gz (one line per attempted address
+    /// that sent none) to this directory after each crawl interval and on exit, and
+    /// gossip-<UTC start>.ndjson.gz (who told us about whom) on exit
     #[clap(long, value_parser)]
     export_dir: Option<PathBuf>,
 
@@ -162,11 +164,37 @@ fn parse_addrs(seed_addrs: Vec<String>, node_listening_port: u16) -> Vec<SocketA
     return parsed_addrs;
 }
 
-/// Writes the census export and logs the outcome.
-fn write_census(census: &Census, dir: &Path, run_start: DateTime<Utc>) {
-    match census.write_ndjson_gz(dir, run_start) {
+/// Writes the census export and its run record, and logs the outcome. The run is complete only
+/// when `finished`, which is true only when a bounded run reached its duration.
+fn write_census(census: &Census, dir: &Path, run_start: DateTime<Utc>, finished: bool) {
+    match census.export(dir, run_start, Utc::now(), finished) {
         Ok(path) => info!("census written to {}", path.display()),
         Err(e) => error!("couldn't write census to {}: {}", dir.display(), e),
+    }
+}
+
+/// How a run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    Interrupt,
+    Duration,
+}
+
+impl Ended {
+    /// Only a run that reached its duration is a finished census. Ctrl-C leaves it partial.
+    fn finished(self) -> bool {
+        self == Ended::Duration
+    }
+}
+
+#[cfg(test)]
+mod ended_tests {
+    use super::Ended;
+
+    #[test]
+    fn only_a_run_that_reached_its_duration_is_finished() {
+        assert!(Ended::Duration.finished());
+        assert!(!Ended::Interrupt.finished());
     }
 }
 
@@ -291,7 +319,7 @@ async fn main() {
 
             if let Some(dir) = &loop_export_dir {
                 let nodes = crawler.known_network.nodes();
-                write_census(&Census::new(&nodes, zcash_tip), dir, run_start);
+                write_census(&Census::new(&nodes, zcash_tip), dir, run_start, false);
             }
         }
     });
@@ -336,14 +364,17 @@ async fn main() {
     };
 
     // Wait for Ctrl-c signal or the end of a bounded run, then abort crawling task.
-    tokio::select! {
+    let ended = tokio::select! {
         _ = signal::ctrl_c() => {
             debug!(parent: crawler_clone.node().span(), "interrupt received, exiting process");
+            Ended::Interrupt
         }
         _ = run_end => {
             info!(parent: crawler_clone.node().span(), "crawl duration reached, exiting process");
+            Ended::Duration
         }
-    }
+    };
+    let finished = ended.finished();
 
     crawling_loop_task.abort();
     let _ = crawling_loop_task.await;
@@ -352,7 +383,13 @@ async fn main() {
     let nodes = crawler_clone.known_network.nodes();
     let census = Census::new(&nodes, zcash_tip);
     if let Some(dir) = &export_dir {
-        write_census(&census, dir, run_start);
+        write_census(&census, dir, run_start, finished);
+        // shortcut: a killed run loses its gossip, write it each interval if that matters.
+        let gossip = crawler_clone.known_network.gossip.read();
+        match write_gossip(&gossip, dir, run_start) {
+            Ok(path) => info!("gossip written to {}", path.display()),
+            Err(e) => error!("couldn't write gossip to {}: {}", dir.display(), e),
+        }
     }
 
     // Print out summary of network metrics.
