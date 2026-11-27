@@ -25,11 +25,11 @@ use tokio::{
 use tracing::{debug, error, info};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 use ziggurat_zcash::protocol::{
-    message::Message,
+    message::{constants::NU7_PROTOCOL_VERSION, Message},
     payload::{
         block::{Headers, LocatorHashes},
         inv::{Inv, InvHash},
-        Hash, Tx,
+        Hash, ProtocolVersion, Tx,
     },
 };
 
@@ -550,7 +550,11 @@ impl Core {
 
     fn on_chain(&mut self, news: ChainNews) {
         match news {
-            ChainNews::Tip(height) => self.tip = Some(height),
+            ChainNews::Tip(height) => {
+                self.tip = Some(height);
+                // The servers' tip, so alert rules can compare each peer's height to it.
+                metrics::gauge!("chain_tip_height", f64::from(height));
+            }
             ChainNews::Blocks { blocks, reset } => {
                 if reset {
                     self.chain = Chain::default();
@@ -1003,7 +1007,7 @@ impl Core {
             let hashes = locator.iter().map(|(_, hash)| *hash).collect();
             peer.last_headers = Some(now);
             peer.asked = Some((now, locator));
-            let request = LocatorHashes::new(hashes, Hash::zeroed());
+            let request = headers_request(hashes, peer.protocol_version);
             self.listener.send(addr, Message::GetHeaders(request));
         }
     }
@@ -1263,6 +1267,14 @@ impl Core {
     }
 }
 
+/// Zebra and Zakura drop a peer whose request names a version other than the negotiated one.
+fn headers_request(hashes: Vec<Hash>, theirs: u32) -> LocatorHashes {
+    LocatorHashes {
+        version: ProtocolVersion(theirs.min(NU7_PROTOCOL_VERSION)),
+        ..LocatorHashes::new(hashes, Hash::zeroed())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pea2pea::protocols::Reading;
@@ -1473,6 +1485,23 @@ mod tests {
         assert_eq!(after[3], 0);
     }
 
+    #[test]
+    fn the_tip_from_the_lookup_servers_is_exported_for_the_alert_rules() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+        // Per-thread, so this test's metrics stay its own. Only the first install in the binary succeeds.
+        let _ = DebuggingRecorder::per_thread().install();
+        let (mut core, dir) = core("tip-gauge");
+        core.on_chain(ChainNews::Tip(3_615_241));
+        let tip = Snapshotter::current_thread_snapshot()
+            .expect("a per-thread recorder")
+            .into_vec()
+            .into_iter()
+            .find(|(key, ..)| key.key().name() == "chain_tip_height")
+            .map(|(.., value)| value);
+        assert_eq!(tip, Some(DebugValue::Gauge(3_615_241.0.into())));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The first testnet headers, with the first one sampled at height 100.
     fn sampled(core: &mut Core) -> Vec<Header> {
         let headers: Vec<Header> = Block::initial_testnet_blocks()
@@ -1490,6 +1519,14 @@ mod tests {
     fn reply(core: &mut Core, peer: &str, headers: &[Header]) {
         let message = Message::Headers(Headers::new(headers.to_vec()));
         core.on_node_event(NodeEvent::Message(addr(peer), message));
+    }
+
+    #[test]
+    fn a_headers_request_carries_the_negotiated_version() {
+        let version = |theirs| headers_request(Vec::new(), theirs).version.0;
+        assert_eq!(version(NU7_PROTOCOL_VERSION), NU7_PROTOCOL_VERSION);
+        assert_eq!(version(170_160), 170_160);
+        assert_eq!(version(NU7_PROTOCOL_VERSION + 10), NU7_PROTOCOL_VERSION);
     }
 
     #[tokio::test]

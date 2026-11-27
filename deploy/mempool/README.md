@@ -59,6 +59,7 @@ The listener counts its alerts in `mempool_alerts_total{rule}`, and Grafana aler
 | `chain_peer_height{peer,user_agent}` | each ready peer's height from its latest headers reply, NaN when it isn't known |
 | `chain_headers_total{result}` | headers requests by outcome: `at`, `at_most`, `unplaced`, `no_reply` |
 | `chain_block_announcements_total` | `block` events |
+| `chain_tip_height` | the tip from the lookup servers, the median of their answers |
 | `mempool_alerts_total{rule}` | per-tx rule alerts |
 | `mempool_fee_lookups_total{result}` | lightwalletd calls for parent txs, `ok` or `error` |
 
